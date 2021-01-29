@@ -204,5 +204,9 @@ from . import starfile
 from .starfile import *
 __all__.extend(starfile.__all__)
 
+from . import interactions
+from .interactions import *
+__all__.extend(interactions.__all__)
+
 from .pdbfile import PDBParseError
 
