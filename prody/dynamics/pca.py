@@ -3,39 +3,47 @@
 essential dynamics analysis (EDA) calculations."""
 
 import time
-
 import numpy as np
+import warnings
+from scipy.spatial.distance import pdist, squareform
+from scipy.linalg import eigh
+
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.decomposition import KernelPCA
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 from prody import LOGGER, PY2K
 from prody.atomic import Atomic
 from prody.ensemble import Ensemble, PDBEnsemble
 from prody.trajectory import TrajBase
-from prody.utilities import importLA, solveEig, ZERO
+from prody.utilities import importLA, ZERO, solveEig
 
 from .nma import NMA
+
 
 if PY2K:
     range = xrange
 
 __all__ = ['PCA', 'EDA']
 
-
 class PCA(NMA):
+    def __init__(self, name):
+        super().__init__(name)
+        self._cov = None
+        self._eigvals = None
+        self._array = None
+        self._vars = None
+        self._n_modes = None
 
-    """A class for Principal Component Analysis (PCA) of conformational
-    ensembles. See examples in :ref:`pca`."""
-
-    def __init__(self, name='Unknown'):
-
-        NMA.__init__(self, name)
 
     def setCovariance(self, covariance, is3d=True):
         """Set covariance matrix."""
-
         if not isinstance(covariance, np.ndarray):
             raise TypeError('covariance must be an ndarray')
-        elif not (covariance.ndim == 2 and
-                  covariance.shape[0] == covariance.shape[1]):
+        elif not (covariance.ndim == 2 and covariance.shape[0] == covariance.shape[1]):
             raise ValueError('covariance must be square matrix')
         elif covariance.dtype != float:
             try:
@@ -73,7 +81,6 @@ class PCA(NMA):
         coordinate set (see :meth:`.Frame.superpose`).  If frames are already
         aligned, use ``aligned=True`` argument to skip this step.
 
-
         .. note::
            If *coordsets* is a :class:`.PDBEnsemble` instance, coordinates are
            treated specially.  Let's say **C**\_ij is the element of the
@@ -109,7 +116,6 @@ class PCA(NMA):
             n_atoms = coordsets.numSelected()
             dof = n_atoms * 3
             cov = np.zeros((dof, dof))
-            #mean = coordsets._getCoords().flatten()
             n_confs = 0
             n_frames = len(coordsets)
             if not quiet:
@@ -161,7 +167,7 @@ class PCA(NMA):
                     mean = coordsets.mean(0)
                     if not quiet:
                         LOGGER.progress('Building covariance', n_confs,
-                                    '_prody_pca')
+                                        '_prody_pca')
                     for i, coords in enumerate(coordsets.reshape(s)):
                         deviations = coords - mean
                         cov += np.outer(deviations, deviations)
@@ -181,51 +187,16 @@ class PCA(NMA):
                 divide_by = weights.astype(float).repeat(3, axis=2).reshape(s)
                 self._cov = np.dot(d_xyz.T, d_xyz) / np.dot(divide_by.T,
                                                             divide_by)
-            if update_coords and ensemble is not None:
-                if mean is None:
-                    mean = coordsets.mean(0)
-                ensemble.setCoords(mean)
+                if update_coords and ensemble is not None:
+                    if mean is None:
+                        mean = coordsets.mean(0)
+                    ensemble.setCoords(mean)
 
         self._trace = self._cov.trace()
         self._dof = dof
         self._n_atoms = n_atoms
         if not quiet:
             LOGGER.report('Covariance matrix calculated in %2fs.', '_prody_pca')
-
-    def calcModes(self, n_modes=20, turbo=True, **kwargs):
-        """Calculate principal (or essential) modes.  This method uses
-        :func:`scipy.linalg.eigh`, or :func:`numpy.linalg.eigh`, function
-        to diagonalize the covariance matrix.
-
-        :arg n_modes: number of non-zero eigenvalues/vectors to calculate,
-            default is 20,
-            if **None** or ``'all'`` is given, all modes will be calculated
-        :type n_modes: int
-
-        :arg turbo: when available, use a memory intensive but faster way to
-            calculate modes, default is **True**
-        :type turbo: bool"""
-        
-        if self._cov is None:
-            raise ValueError('covariance matrix is not built or set')
-        start = time.time()
-        self._clear()
-        if str(n_modes).lower() == 'all':
-            n_modes = None
-        
-        values, vectors, _ = solveEig(self._cov, n_modes=n_modes, zeros=True, 
-                                      turbo=turbo, reverse=True, **kwargs)
-        which = values > ZERO
-        self._eigvals = values[which]
-        self._array = vectors[:, which]
-        self._vars = values[which]
-        self._n_modes = len(self._eigvals)
-        if self._n_modes > 1:
-            LOGGER.debug('{0} modes were calculated in {1:.2f}s.'
-                     .format(self._n_modes, time.time()-start))
-        else:
-            LOGGER.debug('{0} mode was calculated in {1:.2f}s.'
-                     .format(self._n_modes, time.time()-start))
 
     def performSVD(self, coordsets):
         """Calculate principal modes using singular value decomposition (SVD).
@@ -288,7 +259,7 @@ class PCA(NMA):
         If eigen *value* is omitted, it will be set to 1.  Eigenvalues
         are set as variances."""
 
-        NMA.addEigenpair(self, eigenvector, eigenvalue)
+        super().addEigenpair(self, eigenvector, eigenvalue)
         self._vars = self._eigvals
 
     def setEigens(self, vectors, values=None):
@@ -296,8 +267,193 @@ class PCA(NMA):
         omitted, they will be set to 1.  Eigenvalues are set as variances."""
 
         self._clear()
-        NMA.setEigens(self, vectors, values)
+        super().setEigens(self, vectors, values)
         self._vars = self._eigvals
+        
+
+    def computeKernelMatrix(self, coordsets, kernel='rbf', degree=3, gamma=None, alpha=1.0, coef0=0.0):
+        """Compute the kernel matrix for Kernel PCA."""
+        
+        LOGGER.info("Computing Kernel Matrix")
+        if isinstance(coordsets, np.ndarray):
+            coordsets = coordsets.reshape((coordsets.shape[0], -1))
+        elif isinstance(coordsets, Ensemble):
+            coordsets = coordsets.getCoordsets().reshape((coordsets.numConfs(), -1))
+        else:
+            raise TypeError('X must be a numpy array or Ensemble')
+            
+        if kernel == 'linear':
+            return np.dot(coordsets, coordsets.T)
+        elif kernel == 'poly':
+            return (np.dot(coordsets, coordsets.T) + 1) ** degree
+        elif kernel == 'rbf':
+            if gamma is None:
+                gamma = 1.0 / coordsets.shape[1]
+            sq_dists = pdist(coordsets, 'sqeuclidean')
+            mat_sq_dists = squareform(sq_dists)
+            return np.exp(-gamma * mat_sq_dists)
+        elif kernel == 'sigmoid':
+            return np.tanh(alpha * np.dot(coordsets, coordsets.T) + coef0)
+        else:
+            raise ValueError(f"Unsupported kernel: {kernel}")
+        
+        LOGGER.info("Kernel Matrix computed")
+
+    def calcModes(self, n_modes=20, turbo=True, kernel=None, degree=3, gamma=None, alpha=1.0, coef0=0.0, cv=5, max_iter=500, solver='lbfsg', **kwargs):
+        """Calculate principal (or essential) modes using Kernel PCA if a kernel is specified."""
+        
+        if kernel:
+            LOGGER.info("Performing Kernel PCA")
+            if self._cov is None:
+                raise ValueError('covariance matrix is not built or set')
+            start = time.time()
+            self._clear()
+            if str(n_modes).lower() == 'all':
+                n_modes = None
+
+            #Create artifical labels using KMeans
+            labels = self.createArtificialLabels(self._cov)
+            
+            # Optimize kernel PCA parameters
+            if kernel in ['rbf', 'poly', 'sigmoid']:
+                best_params = self.optimizeKernelPCAParams(kernel=kernel, n_modes=n_modes, cv=cv, labels=labels, max_iter=max_iter)
+                degree = best_params.get('kpca__degree', degree)
+                gamma = best_params.get('kpca__gamma', gamma)
+                alpha = best_params.get('kpca__alpha', alpha)
+                coef0 = best_params.get('kpca__coef0', coef0)
+                
+            # Compute the kernel matrix
+            K = self.computeKernelMatrix(self._cov, kernel=kernel, degree=degree, gamma=gamma, alpha=alpha, coef0=coef0)
+
+            # Center the kernel matrix
+            N = K.shape[0]
+            one_n = np.ones((N, N)) / N
+            K_centered = K - one_n @ K - K @ one_n + one_n @ K @ one_n
+
+            # Solve the eigenvalue problem for the centered kernel matrix
+            values, vectors = eigh(K_centered)
+            which = values > ZERO
+            self._eigvals = values[which]
+            self._array = vectors[:, which]
+            self._vars = values[which]
+            self._n_modes = len(self._eigvals)
+            if self._n_modes > 1:
+                LOGGER.debug('{0} modes were calculated in {1:.2f}s.'
+                            .format(self._n_modes, time.time()-start))
+            else:
+                LOGGER.debug('{0} mode was calculated in {1:.2f}s.'
+                            .format(self._n_modes, time.time()-start))
+        else:
+            # Fallback to original PCA calculation if no kernel is specified
+            LOGGER.info("Standard PCA path")
+            if self._cov is None:
+                raise ValueError('covariance matrix is not built or set')
+            start = time.time()
+            self._clear()
+            if str(n_modes).lower() == 'all':
+                n_modes = None
+            
+            values, vectors, _ = solveEig(self._cov, n_modes=n_modes, zeros=True, 
+                                          turbo=turbo, reverse=True, **kwargs)
+            which = values > ZERO
+            self._eigvals = values[which]
+            self._array = vectors[:, which]
+            self._vars = values[which]
+            self._n_modes = len(self._eigvals)
+            if self._n_modes > 1:
+                LOGGER.debug('{0} modes were calculated in {1:.2f}s.'
+                        .format(self._n_modes, time.time()-start))
+            else:
+                LOGGER.debug('{0} mode was calculated in {1:.2f}s.'
+                        .format(self._n_modes, time.time()-start))
+
+    
+    def findBestSolver(self, max_iter=500, cv=5, labels=None):
+    
+        log_reg = LogisticRegression(max_iter=max_iter)
+        
+        clf = Pipeline([
+            ('scaler', StandardScaler()),
+            ('log_reg', log_reg)
+        ])
+        
+        param_grid = {
+            'log_reg__solver': ['lbfgs', 'liblinear', 'sag', 'saga', 'newton-cg']
+        }
+        
+        LOGGER.info("Finding the best solver")
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            grid_search = GridSearchCV(clf, param_grid, cv=cv)
+            grid_search.fit(self._cov, labels)
+        
+        best_solver = grid_search.best_params_['log_reg__solver']
+        LOGGER.info(f"Best solver found: {best_solver}")
+        
+        return best_solver 
+    
+    def optimizeKernelPCAParams(self, kernel='rbf', n_modes=10, cv=5, labels=None, max_iter=500, **kwargs):
+        
+        best_solver = self.findBestSolver(max_iter=max_iter, cv=cv, labels=labels)
+        
+        if kernel == 'poly':
+            param_grid = {
+                'kpca__degree': np.linspace(1, 6, 6)
+            }
+        elif kernel == 'rbf':
+            param_grid = {
+                'kpca__gamma': np.linspace(0.03, 0.06, 20)
+            }
+        elif kernel == 'sigmoid':
+            param_grid = {
+                'kpca__alpha': np.linspace(0.02, 1.00, 50) ,
+                'kpca__coef0': np.linspace(0.00, 10, 50)
+            }
+        else:
+            raise ValueError(f"Unsupported kernel: {kernel}")
+
+
+        log_reg = LogisticRegression(max_iter=max_iter, solver=best_solver)
+        
+        clf = Pipeline([
+            ("scaler", StandardScaler()),
+            ("kpca", KernelPCA(n_components=n_modes, kernel=kernel)),
+            ("log_reg", log_reg)])
+
+        LOGGER.info("Pipeline clf created")
+
+        grid_search = GridSearchCV(clf, param_grid, cv=cv)
+        grid_search.fit(self._cov, labels)
+        
+        # Log mean test score for each solver
+        cv_results = grid_search.cv_results_
+        LOGGER.info("Mean test scores:")
+        for params, mean_score in zip(cv_results['params'], cv_results['mean_test_score']):
+            LOGGER.info(f"Solver: {params['log_reg__solver']}, Mean score: {mean_score:.4f}")
+
+        best_params = grid_search.best_params_
+        LOGGER.info(f"Best parameters found for kernel {kernel}: {best_params}")
+
+        return best_params
+                
+                
+    def createArtificialLabels(self, coordsets, n_clusters=2):
+        """Create artificial labels using KMeans clustering."""
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(coordsets)
+        return kmeans.labels_
+        
+                
+    def _clear(self):
+        """Clear attributes."""
+        self._eigvals = None
+        self._array = None
+        self._vars = None
+        self._n_modes = None
+
+    def _report(self):
+        """Report calculation results."""
+        pass  # Replace with actual reporting functionality
 
 
 class EDA(PCA):
