@@ -299,7 +299,7 @@ class PCA(NMA):
         
         LOGGER.info("Kernel Matrix computed")
 
-    def calcModes(self, n_modes=20, turbo=True, kernel=None, degree=3, gamma=None, alpha=1.0, coef0=0.0, cv=5, max_iter=500, solver='lbfsg', **kwargs):
+    def calcModes(self, n_modes=20, turbo=True, kernel=None, degree=3, gamma=None, alpha=1.0, coef0=0.0, cv=5, max_iter=500, **kwargs):
         """Calculate principal (or essential) modes using Kernel PCA if a kernel is specified."""
         
         if kernel:
@@ -392,6 +392,7 @@ class PCA(NMA):
         LOGGER.info(f"Best solver found: {best_solver}")
         
         return best_solver 
+        
     
     def optimizeKernelPCAParams(self, kernel='rbf', n_modes=10, cv=5, labels=None, max_iter=500, **kwargs):
         
