@@ -27,7 +27,7 @@ __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'calcChannelSurfaceOverlaps', 'calcSurfaceCavities', 
            'calcSurfaceCavitiesMultipleFrames', 'getSurfaceCavityParameters',
            'getSurfaceCavityResidueNames', 'selectSurfaceCavityBySelection',
-           'calcSurfaceCavityOverlaps',
+           'calcSurfaceCavityOverlaps', 'calcPores', 'Pore',
            'getSurfaceCavityResidueNamesMultipleFrames',
            'getSurfaceCavityParametersMultipleFrames', 
            'getChannelParametersMultipleFrames', '_reportAtomsInputComposition',
@@ -823,7 +823,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     sparsity=1, min_tetrahedra=None, max_tetrahedra=None, cavities_only=False,
     diagram="homogenized", max_deviation=0.1, truncate_at_surface=True,
     similarity=0.8, route_tolerance=1.0, min_enclosure=0.70, max_peel_depth=None,
-    weighted_cache=True, weighted_mouth_depth=2.5, edge_cost=None):
+    weighted_cache=True, weighted_mouth_depth=2.5, edge_cost=None,
+    return_details=False):
     """Computes and identifies channels within a molecular structure using 
     Voronoi and Delaunay tessellations.
 
@@ -1099,6 +1100,13 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         straight-chord integral cannot price). The reported bottleneck radius is
         unaffected by this choice.
     :type edge_cost: str or None
+
+    :arg return_details: If True and `cavities_only` is enabled, return an
+        additional dictionary containing internal calculation data required for
+        pore identification, including the channel calculator, simplices,
+        neighboring tetrahedra, Voronoi vertices, atomic coordinates, and van der
+        Waals radii. Default is False.
+    :type return_details: bool
 
     :returns: A tuple containing two elements:
         - `channels`: A list of detected channels, where each channel is an 
@@ -1423,6 +1431,19 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                                          output_path, separate)
 
         LOGGER.report('Surface cavity calculation completed in %.2fs.', '_prody_calcChannels')
+        
+        # Needed for Pores identification:
+        if return_details:
+            details = {
+                'calculator': calculator,
+                'simplices': s_clr.simp,
+                'neighbors': s_clr.neigh,
+                'vertices': s_clr.verti,
+                'coords': coords,
+                'vdw_radii': vdw_radii}
+
+            return (c_filtered_cavities,[coords, s_srf.simp, merged_cavities, s_clr.simp, s_clr.verti], details)
+        
         return c_filtered_cavities, [coords, s_srf.simp, merged_cavities, s_clr.simp, s_clr.verti]
         
     LOGGER.timeit('_prody_channels_pathfinding')
@@ -2925,6 +2946,150 @@ def calcSurfaceCavities(atoms, output_path=None, r1=4.5, r2=2.0, min_depth=1.5,
     return cavities, surface
 
 
+def calcPores(atoms, output_path=None, separate=False, start_point=None, 
+              start_point_search=3.0, r1=3.0, r2=0.9, min_depth=5,
+              min_pore_depth=None, bottleneck=0.0, min_volume=None, 
+              max_volume=None, sparsity=1.0, pore_criterion=True,
+              diagram='homogenized', max_deviation=0.1, min_enclosure=0.70, 
+              max_peel_depth=None, weighted_cache=True, weighted_mouth_depth=2.5,
+              edge_cost=None):
+    """Identify pores connecting distinct openings of the same cavity.
+
+    This function uses :func:`calcChannels` in cavity-only mode to construct
+    the molecular void-space representation. Minimum-cost paths are then
+    calculated directly between distinct surface openings of each cavity.
+
+    :arg atoms: Atomic structure used for pore calculation.
+    :type atoms: :class:`.Atomic`
+
+    :arg output_path: Output PDB or PQR file for detected pores.
+    :type output_path: str or None
+
+    :arg separate: If True, save each pore to a separate file.
+    :type separate: bool
+
+    :arg start_point: Optional point or atomic selection. If provided, only
+        pores passing within `start_point_search` of this region are retained.
+    :type start_point: array-like, :class:`.Atomic`, or None
+
+    :arg start_point_search: Maximum distance from `start_point` to the pore
+        centerline.
+    :type start_point_search: float
+
+    :arg r1: Probe radius used for molecular surface approximation.
+    :type r1: float
+
+    :arg r2: Probe radius used to select accessible internal space.
+    :type r2: float
+
+    :arg min_depth: Minimum depth of cavities included in pore searches.
+    :type min_depth: int
+
+    :arg min_pore_depth: Optional minimum depth reached by a pore path.
+    :type min_pore_depth: float or None
+
+    :arg bottleneck: Minimum allowed pore bottleneck radius.
+    :type bottleneck: float
+
+    :arg min_volume: Optional minimum pore volume.
+    :type min_volume: float or None
+
+    :arg max_volume: Optional maximum pore volume.
+    :type max_volume: float or None
+
+    :arg sparsity: Minimum spatial separation used when grouping surface
+        tetrahedra into distinct openings.
+    :type sparsity: float
+
+    :arg pore_criterion: If True, require the distance between pore openings
+        to exceed half of the pore length.
+    :type pore_criterion: bool
+
+    :returns: Detected pores and molecular surface data.
+    :rtype: tuple
+    """
+
+    if not isinstance(atoms, Atomic):
+        raise TypeError("atoms must be a ProDy Atomic object")
+
+    if isinstance(start_point, Atomic):
+        start_point = np.asarray(calcCenter(start_point), dtype=float)
+    elif start_point is not None:
+        start_point = np.asarray(start_point, dtype=float)
+
+        if start_point.shape != (3,):
+            raise ValueError("start_point must contain three coordinates")
+
+    if start_point_search <= 0:
+        raise ValueError("start_point_search must be greater than zero")
+
+    if bottleneck < 0:
+        raise ValueError("bottleneck must be non-negative")
+
+    if sparsity < 0:
+        raise ValueError("sparsity must be non-negative")
+
+    LOGGER.timeit('_prody_calcPores')
+
+    cavities, surface, details = calcChannels(atoms, output_path=None, separate=False,
+        start_point=None, r1=r1, r2=r2, min_depth=min_depth, bottleneck=0.0,
+        sparsity=sparsity, cavities_only=True, return_details=True,
+        diagram=diagram, max_deviation=max_deviation, min_enclosure=min_enclosure,
+        max_peel_depth=max_peel_depth, weighted_cache=weighted_cache,
+        weighted_mouth_depth=weighted_mouth_depth, edge_cost=edge_cost)
+
+    calculator = details['calculator']
+    simplices = details['simplices']
+    neighbors = details['neighbors']
+    vertices = details['vertices']
+    coords = details['coords']
+    vdw_radii = details['vdw_radii']
+
+    graph = calculator.buildSparseGraph(simplices, neighbors, vertices, coords, vdw_radii)
+    pores = []
+
+    for cavity_index, cavity in enumerate(cavities):
+        cavity_pores = calculator.dijkstraPores(cavity, graph, simplices, neighbors,
+            vertices, coords, vdw_radii, cavity_index=cavity_index,
+            pore_criterion=pore_criterion, min_bottleneck=bottleneck,
+            min_volume=min_volume, max_volume=max_volume,
+            min_pore_depth=min_pore_depth, start_point=start_point,
+            start_point_search=start_point_search)
+
+        pores.extend(cavity_pores)
+    
+    number_before_deduplication = len(pores)
+    #pores = calculator.deduplicatePores(pores, similarity=0.8, mouth_tolerance=sparsity)
+    pores = calculator.deduplicatePores(pores, similarity=0.7, mouth_tolerance=sparsity, route_tolerance=2.5)
+
+    LOGGER.info("Reduced {0} pore candidates to {1} unique pores.".format(
+            number_before_deduplication, len(pores)))
+    
+    LOGGER.info("Detected {0} pores.".format(len(pores)))
+
+    if output_path:
+        if PY3K:
+            from pathlib import Path
+
+        output_path = Path(output_path)
+
+        if output_path.is_dir():
+            output_path = output_path / 'pores.pqr'
+        elif output_path.suffix not in ('.pdb', '.pqr'):
+            output_path = output_path.with_suffix('.pqr')
+
+        if separate:
+            LOGGER.info("Saving individual pores to directory " + str(output_path.parent) + ".")
+        else:
+            LOGGER.info("Saving pores to " + str(output_path) + ".")
+
+        calculator.saveChannelsToPdb(pores, output_path, separate)
+
+    LOGGER.report('Pore calculation completed in %.2fs.', '_prody_calcPores')
+
+    return pores, surface
+
+
 class Channel:
     def __init__(self, tetrahedra, centerline_spline, radius_spline, length, 
                  bottleneck, volume, cost=None):
@@ -3002,6 +3167,36 @@ class Cavity:
         
     def addChannel(self, channel):
         self.channels.append(channel)
+
+
+class Pore(Channel):
+    """Represent a pathway connecting two molecular surface openings."""
+
+    def __init__(self, tetrahedra, centerline_spline, radius_spline,
+                 length, bottleneck, volume, cost=None,
+                 cavity_index=None, mouth_tetrahedra=None,
+                 mouth_centers=None, mouth_radii=None,
+                 max_depth=None):
+
+        super(Pore, self).__init__(tetrahedra, centerline_spline, radius_spline, 
+                                    length, bottleneck, volume, cost=cost)
+
+        self.cavity_index = cavity_index
+        self.mouth_tetrahedra = mouth_tetrahedra
+        self.mouth_centers = mouth_centers
+        self.mouth_radii = mouth_radii
+        self.max_depth = max_depth
+
+        if mouth_centers is not None:
+            self.end_to_end_distance = float(
+                np.linalg.norm(np.asarray(mouth_centers[1]) - np.asarray(mouth_centers[0])))
+        else:
+            self.end_to_end_distance = None
+
+        if (self.end_to_end_distance is not None and self.length > 0):
+            self.pore_ratio = (self.end_to_end_distance / (0.5 * self.length))
+        else:
+            self.pore_ratio = None
     
         
 def _rowsIsin(a, b):
@@ -3592,7 +3787,6 @@ class ChannelCalculator:
 
         return filtered_surface_simplices, second_layer
 
-            
     def findGroups(self, neigh, is_cavity=True):
         x = neigh.shape[0]
         visited = np.zeros(x, dtype=bool)
@@ -3646,7 +3840,6 @@ class ChannelCalculator:
                 surface_cavities.append(cavity)
                 
         return surface_cavities
-
 
     def mergeCavities(self, cavities, simplices):
         if not cavities:
@@ -4117,8 +4310,381 @@ class ChannelCalculator:
             for channel, _costs in candidates:
                 cavity.addChannel(channel)
 
+    def dijkstraPores(self, cavity, graph, simplices, neighbors,
+                      vertices, points, vdw_radii, cavity_index=None,
+                      pore_criterion=True, min_bottleneck=0.0,
+                      min_volume=None, max_volume=None,
+                      min_pore_depth=None, start_point=None,
+                      start_point_search=3.0):
+        """Find minimum-cost paths between distinct mouths of one cavity.
+
+        Each physical mouth may consist of several neighboring surface
+        tetrahedra. All tetrahedra assigned to the source mouth are used as
+        simultaneous starting nodes. Tetrahedra belonging to the remaining
+        mouths are treated as absorbing nodes, so a path terminates when it first
+        reaches another molecular opening.
+
+        Candidate paths are converted into :class:`Pore` objects and filtered
+        according to their geometry, bottleneck, volume, maximum internal depth,
+        and optional proximity to a user-defined point.
+        """
+
+        from scipy.sparse.csgraph import dijkstra
+
+        # Restrict the search to tetrahedra belonging to the current cavity.
+        # Dijkstra operates on local indices for efficiency, while paths are
+        # converted back to global tetrahedron indices before further analysis.
+        cavity_tetra = np.asarray(cavity.tetrahedra, dtype=np.intp)
+
+        if len(cavity_tetra) == 0:
+            return []
+
+        global_to_local = {int(tetra): index for index, tetra in enumerate(cavity_tetra)}
+
+        # exit_tetrahedra contains all cavity tetrahedra connected to the
+        # molecular surface. Several such tetrahedra may describe the same
+        # physical opening and will therefore be grouped into one mouth below.
+        exit_tetra = np.asarray(cavity.exit_tetrahedra, dtype=np.intp)
+
+        # Keep only exits that are present in the filtered cavity graph. This is
+        # important because cavity filtering may remove tetrahedra that existed
+        # in an earlier representation of the molecular void space.
+        exit_tetra = np.asarray([tetra for tetra in exit_tetra if int(tetra) in global_to_local], dtype=np.intp)
+
+        if len(exit_tetra) < 2:
+            return []
+
+        # Determine the available radius at every surface tetrahedron. The
+        # clearance cache is normally created by buildSparseGraph(). The fallback
+        # calculation allows the method to remain usable if the cache is absent.
+        if self._vertex_clearance is not None:
+            exit_clearance = np.asarray(self._vertex_clearance[exit_tetra], dtype=float)
+        else:
+            exit_clearance = np.asarray([self.calculateMaxRadius(
+                    vertices[tetra], points,
+                    vdw_radii,simplices[tetra])
+                for tetra in exit_tetra], dtype=float)
+
+        # Remove surface tetrahedra that cannot accommodate the probe used during
+        # the cavity calculation. Such points should not serve as pore openings.
+        valid = exit_clearance >= self.r2
+        exit_tetra = exit_tetra[valid]
+        exit_clearance = exit_clearance[valid]
+
+        if len(exit_tetra) < 2:
+            return []
+
+        exit_centers = vertices[exit_tetra]
+
+        # The grouping radius is based on the local opening clearance, but cannot
+        # be smaller than sparsity. This merges nearby surface tetrahedra that
+        # represent the same physical opening rather than treating each mesh
+        # element as a separate mouth.
+        opening_radii = np.maximum(exit_clearance, float(self.sparsity))
+
+        # Start grouping from the widest exits. A wide representative usually
+        # provides the most stable geometric description of a molecular opening.
+        order = np.argsort(-exit_clearance)
+        available = np.ones(len(exit_tetra), dtype=bool)
+        mouths = []
+
+        for index in order:
+            if not available[index]:
+                continue
+
+            distances = np.linalg.norm(exit_centers - exit_centers[index], axis=1)
+
+            # Surface tetrahedra whose centers fall within the effective opening
+            # radius are assigned to the same mouth. Only tetrahedra that have not
+            # already been assigned to another mouth are considered.
+            same_opening = (available & (distances <= np.maximum(opening_radii[index], opening_radii)))
+
+            members = np.flatnonzero(same_opening)
+            available[members] = False
+
+            mouths.append({
+                'tetrahedra': exit_tetra[members],
+                'representative': int(exit_tetra[index]),
+                'center': exit_centers[index].copy(),
+                'radius': float(opening_radii[index])})
+
+        # A pore must connect at least two distinct molecular openings.
+        if len(mouths) < 2:
+            return []
+
+        # Extract the part of the full weighted graph that belongs to this cavity.
+        # The graph weights already account for path length and the clearance of
+        # the gates between neighboring tetrahedra.
+        cavity_graph_base = graph[np.ix_(cavity_tetra, cavity_tetra)].tocsr()
+        all_exit_local = np.asarray([global_to_local[int(tetra)] for tetra in exit_tetra], dtype=np.intp)
+        pores = []
+        # Each mouth is used once as the source. One multi-source Dijkstra search
+        # finds the best routes from all tetrahedra of that mouth to every other
+        # reachable mouth. This avoids selecting an arbitrary representative
+        # tetrahedron as the only starting point.
+        for mouth_index1 in range(len(mouths) - 1):
+            source_global = mouths[mouth_index1]['tetrahedra']
+            source_local = np.asarray([global_to_local[int(tetra)] for tetra in source_global], dtype=np.intp)
+            source_set = set(source_local.tolist())
+            # All exits outside the source mouth are absorbing. A path may enter
+            # such a tetrahedron, but it may not leave it again. Consequently, the
+            # path terminates at the first molecular opening that it encounters
+            # instead of leaving the protein, crossing the exterior, and entering
+            # again through another opening.
+            absorbing = [int(index) for index in all_exit_local if int(index) not in source_set]
+            cavity_graph = cavity_graph_base.tolil(copy=True)
+
+            for index in absorbing:
+                cavity_graph.rows[index] = []
+                cavity_graph.data[index] = []
+
+            cavity_graph = cavity_graph.tocsr()
+
+            # The original cavity graph is effectively undirected, but removal of
+            # outgoing edges from absorbing mouths makes the modified graph
+            # directional. Each source tetrahedron receives an independent
+            # predecessor tree.
+            distances, predecessors = dijkstra(cavity_graph, directed=True, indices=source_local, 
+                                                return_predecessors=True)
+
+            if distances.ndim == 1:
+                distances = distances[np.newaxis, :]
+                predecessors = predecessors[np.newaxis, :]
+
+            # Only unordered mouth pairs are analyzed. Once mouth A to mouth B has
+            # been considered, the reverse B to A route is not calculated again.
+            for mouth_index2 in range(mouth_index1 + 1, len(mouths)):
+                target_global = mouths[mouth_index2]['tetrahedra']
+
+                target_local = np.asarray([global_to_local[int(tetra)] for tetra in target_global], dtype=np.intp)
+
+                # A mouth may contain several source and target tetrahedra. Select
+                # the minimum-cost combination over every source-target pair rather
+                # than forcing the route through either mouth representative.
+                target_distances = distances[:, target_local]
+                best_flat = int(np.argmin(target_distances))
+                source_row, target_column = np.unravel_index(best_flat, target_distances.shape)
+                cost = float(target_distances[source_row, target_column])
+
+                if not np.isfinite(cost):
+                    continue
+
+                target = int(target_local[target_column])
+
+                # Reconstruct the minimum-cost route from the selected target
+                # tetrahedron back to the source tetrahedron using the predecessor
+                # tree generated by Dijkstra.
+                path_local = [target]
+                current = target
+
+                while predecessors[source_row, current] >= 0:
+                    current = int(predecessors[source_row, current])
+                    path_local.append(current)
+
+                path_local.reverse()
+
+                # The reconstructed path must begin at one of the tetrahedra
+                # belonging to the selected source mouth.
+                if path_local[0] not in source_set:
+                    continue
+
+                path_global = cavity_tetra[np.asarray(path_local, dtype=np.intp)]
+
+                # Validate the reconstructed route against the original Delaunay
+                # neighborhood. This guards against inconsistent local/global index
+                # conversion and ensures that every consecutive pair of tetrahedra
+                # shares a valid graph connection.
+                valid_path = True
+
+                for first, second in zip(path_global[:-1], path_global[1:]):
+                    if int(second) not in neighbors[int(first)]:
+                        valid_path = False
+                        break
+
+                if not valid_path:
+                    continue
+
+                # Reuse the standard channel-processing procedure so pores and
+                # channels are described consistently. This constructs the
+                # centerline and radius splines and calculates length, bottleneck,
+                # and volume from the complete tetrahedral path.
+                geometry = self.processChannel(path_global, vertices, points, vdw_radii, simplices)
+
+                centerline_spline = geometry[0]
+                radius_spline = geometry[1]
+                length = geometry[2]
+                bottleneck = geometry[3]
+                volume = geometry[4]
+
+                mouth_centers = (vertices[path_global[0]].copy(),
+                    vertices[path_global[-1]].copy())
+
+                end_to_end_distance = float(np.linalg.norm(mouth_centers[1] - mouth_centers[0]))
+
+                # Apply the pore criterion used to distinguish a through-pore from
+                # a curved path connecting two nearby points within the same
+                # surface depression. The opening-to-opening distance must exceed
+                # half of the full path length.
+                if (pore_criterion and end_to_end_distance <= 0.5 * length):
+                    continue
+
+                # The bottleneck represents the smallest available radius along
+                # the complete mouth-to-mouth path, including restrictions at the
+                # gates between consecutive tetrahedra.
+                if bottleneck < min_bottleneck:
+                    continue
+
+                if (min_volume is not None and volume < min_volume):
+                    continue
+
+                if (max_volume is not None and volume > max_volume):
+                    continue
+
+                # A true pore should penetrate the molecular interior rather than
+                # merely connect neighboring positions on the same shallow surface
+                # depression. The maximum cavity depth reached by the path can be
+                # used as an optional additional filter.
+                path_depths = np.asarray([cavity.tetrahedra_depths.get(int(tetra), 0.0)
+                    for tetra in path_global], dtype=float)
+
+                if len(path_depths):
+                    max_depth = float(np.max(path_depths))
+                else:
+                    max_depth = 0.0
+
+                if (min_pore_depth is not None and max_depth < min_pore_depth):
+                    continue
+
+                # In pore analysis, start_point does not define the source of the
+                # search. The sources and targets are molecular mouths. Instead,
+                # the point acts as a post-search constraint retaining only pores
+                # that pass through a user-selected region, such as an ion-binding
+                # site or the expected center of a transmembrane pore.
+                if start_point is not None:
+                    n_samples = max(20, 5 * len(path_global))
+                    parameter = np.linspace(centerline_spline.x[0], centerline_spline.x[-1], n_samples)
+                    sampled_points = centerline_spline(parameter)
+                    nearest = float(np.min(np.linalg.norm(sampled_points - start_point, axis=1)))
+
+                    if nearest > start_point_search:
+                        continue
+
+                # The terminal radii describe the local sizes of the two detected
+                # openings. buildSparseGraph() normally initializes the clearance
+                # cache used here.
+                mouth_radii = (float(max(self._vertex_clearance[path_global[0]],self.sparsity)),
+                    float(max(self._vertex_clearance[path_global[-1]], self.sparsity)))
+
+                pore = Pore(path_global, centerline_spline, radius_spline,
+                    length, bottleneck, volume, cost=cost, cavity_index=cavity_index,
+                    mouth_tetrahedra=(mouths[mouth_index1]['tetrahedra'].copy(),
+                    mouths[mouth_index2]['tetrahedra'].copy()),
+                    mouth_centers=mouth_centers, mouth_radii=mouth_radii, max_depth=max_depth)
+
+                pores.append(pore)
+
+        # Rank pores by the same weighted graph cost used during path detection.
+        # Lower-cost pores preferentially combine short routes with sufficiently
+        # wide local clearances.
+        pores.sort(key=lambda pore: pore.cost)
+
+        return pores
+        
+
+    def deduplicatePores(self, pores, similarity=0.8, mouth_tolerance=None,
+                     route_tolerance=None):
+        """Remove duplicate pores connecting the same pair of surface openings.
+
+        Pores are treated as duplicates when they belong to the same cavity,
+        connect overlapping representations of the same two openings, irrespective
+        of orientation, and their centerlines overlap by at least `similarity`.
+        The pore with the lowest Dijkstra cost is retained.
+
+        :arg pores: Pore candidates to compare.
+        :type pores: list
+
+        :arg similarity: Minimum centerline overlap required for two pores to be
+            considered the same pathway. Default is 0.8.
+        :type similarity: float
+
+        :arg mouth_tolerance: Minimum distance used to determine whether two pore
+            endpoints represent the same opening. If None, `self.sparsity` is used.
+        :type mouth_tolerance: float or None
+
+        :arg route_tolerance: Maximum distance, in Angstrom, between sampled points
+            of two pore centerlines used when calculating their geometric overlap. If
+            None, `self.route_tolerance` is used.
+        :type route_tolerance: float or None
+
+        :returns: Deduplicated pores ordered by increasing Dijkstra cost.
+        :rtype: list """
+
+        if not pores:
+            return []
+
+        if similarity < 0 or similarity > 1:
+            raise ValueError("similarity must be between 0 and 1")
+
+        if mouth_tolerance is None:
+            mouth_tolerance = float(self.sparsity)
+
+        if route_tolerance is None:
+            route_tolerance = float(self.route_tolerance)
+
+        ordered = sorted(pores, key=lambda pore: pore.cost if pore.cost is not None else float('inf'))
+        kept = []
+
+        for pore in ordered:
+            spline = pore.centerline_spline
+            n_samples = max(50, 5 * len(pore.tetrahedra))
+            parameter = np.linspace(spline.x[0], spline.x[-1], n_samples)
+            path_points = spline(parameter)
+
+            if pore.mouth_centers is not None:
+                mouth_centers = np.asarray(pore.mouth_centers, dtype=float)
+            else:
+                mouth_centers = np.asarray([path_points[0], path_points[-1]], dtype=float)
+
+            if pore.mouth_radii is not None:
+                mouth_radii = np.asarray(pore.mouth_radii, dtype=float)
+            else:
+                mouth_radii = np.full(2, mouth_tolerance, dtype=float)
+
+            duplicate = False
+
+            for kept_pore, kept_points, kept_centers, kept_radii in kept:
+                if pore.cavity_index != kept_pore.cavity_index:
+                    continue
+
+                direct_start_limit = max(mouth_tolerance, mouth_radii[0] + kept_radii[0])
+                direct_end_limit = max(mouth_tolerance, mouth_radii[1] + kept_radii[1])
+                reverse_start_limit = max(mouth_tolerance, mouth_radii[0] + kept_radii[1])
+                reverse_end_limit = max(mouth_tolerance, mouth_radii[1] + kept_radii[0])
+                direct_start = np.linalg.norm(mouth_centers[0] - kept_centers[0]) <= direct_start_limit
+                direct_end = np.linalg.norm(mouth_centers[1] - kept_centers[1]) <= direct_end_limit
+                reverse_start = np.linalg.norm(mouth_centers[0] - kept_centers[1]) <= reverse_start_limit
+                reverse_end = np.linalg.norm(mouth_centers[1] - kept_centers[0]) <= reverse_end_limit
+
+                same_openings = (direct_start and direct_end) or (reverse_start and reverse_end)
+
+                if not same_openings:
+                    continue
+
+                coverage1 = self._routeCoverage(path_points, kept_points, tol=route_tolerance)
+                coverage2 = self._routeCoverage(kept_points, path_points, tol=route_tolerance)
+                coverage = min(coverage1, coverage2)
+
+                if coverage >= similarity:
+                    duplicate = True
+                    break
+
+            if not duplicate:
+                kept.append((pore, path_points, mouth_centers, mouth_radii))
+
+        return [pore for pore, _points, _centers, _radii in kept]
+
     def _addDedupedChannels(self, cavity, candidates, similarity, vertices,
-                            points, vdw_radii, simplices):
+                                points, vdw_radii, simplices):
         # Cheapest first, and each candidate is judged only against the channels
         # already kept - so the kept channel is always the cheapest of its group
         # and the result does not depend on the order candidates arrive in.
