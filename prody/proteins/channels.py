@@ -2964,6 +2964,7 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
     :type atoms: :class:`.Atomic`
 
     :arg output_path: Output PDB or PQR file for detected pores.
+        Default is None.
     :type output_path: str or None
 
     :arg separate: If True, save each pore to a separate file.
@@ -2971,35 +2972,44 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
 
     :arg start_point: Optional point or atomic selection. If provided, only
         pores passing within `start_point_search` of this region are retained.
+        Default is None.
     :type start_point: array-like, :class:`.Atomic`, or None
 
     :arg start_point_search: Maximum distance from `start_point` to the pore
-        centerline.
+        centerline. Default is 3.0.
     :type start_point_search: float
 
     :arg r1: Probe radius used for molecular surface approximation.
+        Default is 10.
     :type r1: float
 
     :arg r2: Probe radius used to select accessible internal space.
+        Default is 1.2.
     :type r2: float
 
     :arg min_depth: Minimum depth of cavities included in pore searches.
+        Default is 5.0.
     :type min_depth: int
 
     :arg min_pore_depth: Optional minimum depth reached by a pore path.
+        Default is 5.0.
     :type min_pore_depth: float or None
 
     :arg bottleneck: Minimum allowed pore bottleneck radius.
+        Default is 0.0.
     :type bottleneck: float
 
     :arg min_volume: Optional minimum pore volume.
+        Default is None.
     :type min_volume: float or None
 
     :arg max_volume: Optional maximum pore volume.
+        Default is None.
     :type max_volume: float or None
 
     :arg sparsity: Minimum spatial separation used when grouping surface
         tetrahedra into distinct openings.
+        Default is None.
     :type sparsity: float
 
     :arg pore_criterion: If True, require the distance between pore openings
