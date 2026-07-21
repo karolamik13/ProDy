@@ -2946,9 +2946,9 @@ def calcSurfaceCavities(atoms, output_path=None, r1=4.5, r2=2.0, min_depth=1.5,
     return cavities, surface
 
 
-def calcPores(atoms, output_path=None, separate=False, start_point=None, 
-              start_point_search=3.0, r1=10.0, r2=1.2, min_depth=5.0,
-              min_pore_depth=5.0, bottleneck=0.0, min_volume=None, 
+def calcPores(atoms, output_path=None, separate=False, pore_mode='standard', 
+              start_point=None, start_point_search=3.0, r1=10.0, r2=1.2, 
+              min_depth=5.0, min_pore_depth=5.0, bottleneck=0.0, min_volume=None, 
               max_volume=None, sparsity=5.0, pore_criterion=True,
               similarity=0.7, route_tolerance=2.0, min_mouth_angle=None,
               diagram='homogenized', max_deviation=0.1, min_enclosure=0.70, 
@@ -2969,6 +2969,13 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
 
     :arg separate: If True, save each pore to a separate file.
     :type separate: bool
+
+    :arg pore_mode: Pore-detection preset. ``'standard'`` uses the default
+        parameters and is intended for relatively wide and well-defined pores.
+        ``'narrow'`` applies more permissive settings for narrow pores by using
+        ``r2=0.8``, ``min_depth=5.0``, and ``min_pore_depth=10.0``.
+        Default is ``'standard'``.
+    :type pore_mode: str
 
     :arg start_point: Optional point or atomic selection. If provided, only
         pores passing within `start_point_search` of this region are retained.
@@ -3038,6 +3045,14 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
         if start_point.shape != (3,):
             raise ValueError("start_point must contain three coordinates")
 
+    if pore_mode not in ('standard', 'narrow'):
+        raise ValueError("pore_mode must be 'standard', or 'narrow'")
+    
+    if pore_mode == 'narrow':
+        r2 = 0.8
+        min_depth = 5.0
+        min_pore_depth = 10.0
+    
     if start_point_search <= 0:
         raise ValueError("start_point_search must be greater than zero")
 
@@ -3085,7 +3100,6 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
         pores.extend(cavity_pores)
     
     number_before_deduplication = len(pores)
-    #pores = calculator.deduplicatePores(pores, similarity=0.8, mouth_tolerance=sparsity)
     pores = calculator.deduplicatePores(pores, similarity=0.7, mouth_tolerance=sparsity, route_tolerance=2.5)
 
     LOGGER.info("Reduced {0} pore candidates to {1} unique pores.".format(
