@@ -3055,11 +3055,6 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
         elif min_mouth_angle < 0 or min_mouth_angle > 180:
             raise ValueError("min_mouth_angle must be between 0 and 180 degrees or None")
 
-    if np.isnan(min_mouth_angle):
-        min_mouth_angle = None
-    elif min_mouth_angle < 0 or min_mouth_angle > 180:
-        raise ValueError("min_mouth_angle must be between 0 and 180 degrees or None")
-
     LOGGER.timeit('_prody_calcPores')
 
     cavities, surface, details = calcChannels(atoms, output_path=None, separate=False,
