@@ -2947,9 +2947,10 @@ def calcSurfaceCavities(atoms, output_path=None, r1=4.5, r2=2.0, min_depth=1.5,
 
 
 def calcPores(atoms, output_path=None, separate=False, start_point=None, 
-              start_point_search=3.0, r1=3.0, r2=0.9, min_depth=5,
-              min_pore_depth=None, bottleneck=0.0, min_volume=None, 
-              max_volume=None, sparsity=1.0, pore_criterion=True,
+              start_point_search=3.0, r1=10.0, r2=1.2, min_depth=5.0,
+              min_pore_depth=5.0, bottleneck=0.0, min_volume=None, 
+              max_volume=None, sparsity=5.0, pore_criterion=True,
+              similarity=0.7, route_tolerance=2.0, min_mouth_angle=None,
               diagram='homogenized', max_deviation=0.1, min_enclosure=0.70, 
               max_peel_depth=None, weighted_cache=True, weighted_mouth_depth=2.5,
               edge_cost=None):
@@ -3005,6 +3006,13 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
         to exceed half of the pore length.
     :type pore_criterion: bool
 
+    :arg min_mouth_angle: Optional minimum angle, in degrees, between vectors
+        extending from the deepest point of the cavity to the two pore openings.
+        Candidates with smaller angles are discarded. This favors pores connecting
+        openings located on opposite sides of the cavity. Values must be between
+        0 and 180. If None, no angular filtering is applied. Default is None.
+    :type min_mouth_angle: float or None
+
     :returns: Detected pores and molecular surface data.
     :rtype: tuple
     """
@@ -3028,6 +3036,19 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
 
     if sparsity < 0:
         raise ValueError("sparsity must be non-negative")
+        
+    if min_mouth_angle is not None:
+        min_mouth_angle = float(min_mouth_angle)
+        
+        if np.isnan(min_mouth_angle):
+            min_mouth_angle = None
+        elif min_mouth_angle < 0 or min_mouth_angle > 180:
+            raise ValueError("min_mouth_angle must be between 0 and 180 degrees or None")
+
+    if np.isnan(min_mouth_angle):
+        min_mouth_angle = None
+    elif min_mouth_angle < 0 or min_mouth_angle > 180:
+        raise ValueError("min_mouth_angle must be between 0 and 180 degrees or None")
 
     LOGGER.timeit('_prody_calcPores')
 
@@ -3052,7 +3073,7 @@ def calcPores(atoms, output_path=None, separate=False, start_point=None,
         cavity_pores = calculator.dijkstraPores(cavity, graph, simplices, neighbors,
             vertices, coords, vdw_radii, cavity_index=cavity_index,
             pore_criterion=pore_criterion, min_bottleneck=bottleneck,
-            min_volume=min_volume, max_volume=max_volume,
+            min_volume=min_volume, max_volume=max_volume, min_mouth_angle=min_mouth_angle,
             min_pore_depth=min_pore_depth, start_point=start_point,
             start_point_search=start_point_search)
 
@@ -4313,7 +4334,7 @@ class ChannelCalculator:
     def dijkstraPores(self, cavity, graph, simplices, neighbors,
                       vertices, points, vdw_radii, cavity_index=None,
                       pore_criterion=True, min_bottleneck=0.0,
-                      min_volume=None, max_volume=None,
+                      min_volume=None, max_volume=None, min_mouth_angle=None,
                       min_pore_depth=None, start_point=None,
                       start_point_search=3.0):
         """Find minimum-cost paths between distinct mouths of one cavity.
@@ -4521,6 +4542,20 @@ class ChannelCalculator:
 
                 end_to_end_distance = float(np.linalg.norm(mouth_centers[1] - mouth_centers[0]))
 
+                cavity_center = vertices[int(cavity.starting_tetrahedron[0])]
+                vector1 = mouth_centers[0] - cavity_center
+                vector2 = mouth_centers[1] - cavity_center
+                distance1 = float(np.linalg.norm(vector1))
+                distance2 = float(np.linalg.norm(vector2))
+                mouth_angle = float('nan')
+
+                if distance1 > 1e-9 and distance2 > 1e-9:
+                    cos_angle = np.dot(vector1, vector2) / (distance1 * distance2)
+                    mouth_angle = float(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
+
+                if min_mouth_angle is not None and (not np.isfinite(mouth_angle) or mouth_angle < min_mouth_angle):
+                    continue
+
                 # Apply the pore criterion used to distinguish a through-pore from
                 # a curved path connecting two nearby points within the same
                 # surface depression. The opening-to-opening distance must exceed
@@ -4581,6 +4616,7 @@ class ChannelCalculator:
                     mouths[mouth_index2]['tetrahedra'].copy()),
                     mouth_centers=mouth_centers, mouth_radii=mouth_radii, max_depth=max_depth)
 
+                pore.mouth_angle = mouth_angle
                 pores.append(pore)
 
         # Rank pores by the same weighted graph cost used during path detection.
