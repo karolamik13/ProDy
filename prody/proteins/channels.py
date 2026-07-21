@@ -23,7 +23,7 @@ from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD
 __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
            'getChannelParameters', 'getChannelAtoms', 'showChannels', 
            'showCavities', 'showSurfaceCavities', 'selectChannelBySelection', 
-           'getChannelResidueNames',
+           'getChannelResidueNames', 'showPores',
            'calcChannelSurfaceOverlaps', 'calcSurfaceCavities', 
            'calcSurfaceCavitiesMultipleFrames', 'getSurfaceCavityParameters',
            'getSurfaceCavityResidueNames', 'selectSurfaceCavityBySelection',
@@ -815,6 +815,20 @@ def showSurfaceCavities(surface, cavities=None, model=None, show_surface=False,
         meshes_to_visualize.append(line_set)
 
     o3d.visualization.draw_geometries(meshes_to_visualize)
+
+
+def showPores(pores, model=None, show_surface=False, surface=None, **kwargs):
+    """Visualize pores calculated with :func:`calcPores`.
+
+    This function uses the same visualization procedure as
+    :func:`showChannels`, because :class:`Pore` inherits from :class:`Channel`.
+
+    :arg pores: Pore or sequence of Pore objects to visualize.
+    :type pores: Pore or list
+    """
+
+    return showChannels(pores, model=model, surface=surface, **kwargs)
+
 
 def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     restrict_channels_to_start_point=True, start_point_search=3.0,
