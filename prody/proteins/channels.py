@@ -596,7 +596,7 @@ def showSurfaceCavities(surface, cavities=None, model=None, show_surface=False,
     Cavities can be visualized either directly from the tetrahedral/Voronoi
     representation returned by the calculation, or from pseudoatoms loaded from
     a PDB/PQR file through `cavity_atoms`.
-
+    
     - `mode='tetra'` displays cavities as a tetrahedron-derived mesh.
       This mode follows the original geometric representation most closely,
       but the resulting surface may appear faceted.
@@ -2846,6 +2846,21 @@ def calcSurfaceCavities(atoms, output_path=None, r1=4.5, r2=2.0, min_depth=1.5,
                         separate=False):
     """Calculate surface cavities (pockets) on protein surface using CaviTracer 
     approach.
+    
+    The surface-cavity detection procedure consists of the following steps:
+
+    1. Select atoms, assign van der Waals radii, and construct the
+       Delaunay triangulation and the corresponding Voronoi diagram.
+    2. Approximate the molecular surface by iteratively removing tetrahedra
+       accessible to a spherical probe of radius ``r1``.
+    3. Select tetrahedra large enough to accommodate a probe of radius ``r2``,
+       defining the void space considered during cavity detection.
+    4. Merge connected tetrahedra into surface-accessible cavities, identify their
+       openings, and calculate cavity depths from the molecular surface.
+    5. Optionally trim cavities at ``max_depth`` and filter them according to depth,
+       volume, and number of tetrahedra.
+    6. Optionally save the detected cavities to PDB/PQR files and return the cavity
+       objects together with the molecular surface representation.
 
     :arg atoms: An object representing the molecular structure, typically 
         containing atomic coordinates and element types.
