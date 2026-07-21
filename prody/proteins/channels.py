@@ -824,8 +824,7 @@ def showPores(pores, model=None, show_surface=False, surface=None, **kwargs):
     :func:`showChannels`, because :class:`Pore` inherits from :class:`Channel`.
 
     :arg pores: Pore or sequence of Pore objects to visualize.
-    :type pores: Pore or list
-    """
+    :type pores: Pore or list """
 
     return showChannels(pores, model=model, surface=surface, **kwargs)
 
@@ -2973,6 +2972,25 @@ def calcPores(atoms, output_path=None, separate=False, pore_mode='standard',
     This function uses :func:`calcChannels` in cavity-only mode to construct
     the molecular void-space representation. Minimum-cost paths are then
     calculated directly between distinct surface openings of each cavity.
+
+    The pore-detection procedure consists of the following steps:
+
+    1. Construct the Delaunay triangulation and the corresponding Voronoi diagram
+       from the atomic coordinates.
+    2. Approximate the molecular surface using a spherical probe of radius ``r1``.
+    3. Select internal tetrahedra that can accommodate a probe of radius ``r2``.
+    4. Merge connected tetrahedra into surface-connected cavities and calculate
+       their depths.
+    5. Group surface exit tetrahedra into distinct cavity openings.
+    6. Use Dijkstra's algorithm to find optimal paths between pairs of different
+       openings within the same cavity.
+    7. Construct pore representations, calculate their geometric properties, and
+       filter the results according to depth, bottleneck, volume, opening geometry,
+       and path similarity.
+    8. Remove redundant paths representing the same pore.
+
+    The function returns the detected pores together with the approximated
+    molecular surface.
 
     :arg atoms: Atomic structure used for pore calculation.
     :type atoms: :class:`.Atomic`
