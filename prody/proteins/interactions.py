@@ -13,24 +13,29 @@ The following interactions are available for protein interactions:
 """
 
 __author__ = 'Karolina Mikulska-Ruminska'
-__credits__ = ['James Krieger', 'Karolina Mikulska-Ruminska']
-__email__ = ['karolamik@fizyka.umk.pl', 'jamesmkrieger@gmail.com']
+__credits__ = ['James Krieger', 'Karolina Mikulska-Ruminska', 'Anupam Banerjee']
+__email__ = ['karolamik@fizyka.umk.pl', 'jamesmkrieger@gmail.com', 'anupam.banerjee@stonybrook.edu']
+
 
 import numpy as np
 from numpy import *
 from prody import LOGGER, SETTINGS, PY3K
 from prody.atomic import AtomGroup, Atom, Atomic, Selection, Select
-from prody.atomic import flags
+from prody.atomic import flags, sliceAtomicData
 from prody.utilities import importLA, checkCoords, showFigure, getCoords
 from prody.measure import calcDistance, calcAngle, calcCenter
 from prody.measure.contacts import findNeighbors
-from prody.proteins import writePDB, parsePDB
+from prody.proteins import writePDB, parsePDB, showProtein
 from collections import Counter
 
-from prody.trajectory import TrajBase, Trajectory
+from prody.trajectory import TrajBase, Trajectory, Frame
 from prody.ensemble import Ensemble
 
-import multiprocessing
+import multiprocessing as mp
+from .fixer import *
+from .compare import *
+from prody.measure import calcTransformation, calcDistance, calcRMSD, superpose
+
 
 __all__ = ['calcHydrogenBonds', 'calcChHydrogenBonds', 'calcSaltBridges',
            'calcRepulsiveIonicBonding', 'calcPiStacking', 'calcPiCation',
@@ -40,12 +45,15 @@ __all__ = ['calcHydrogenBonds', 'calcChHydrogenBonds', 'calcSaltBridges',
            'calcPiCationTrajectory', 'calcHydrophobicTrajectory', 'calcDisulfideBondsTrajectory',
            'calcProteinInteractions', 'calcStatisticsInteractions', 'calcDistribution',
            'calcSASA', 'calcVolume','compareInteractions', 'showInteractionsGraph',
-           'calcLigandInteractions', 'listLigandInteractions', 
+           'showInteractionsHist', 'calcLigandInteractions', 'listLigandInteractions', 
+           'showProteinInteractions', 'showLigandInteraction',
            'showProteinInteractions_VMD', 'showLigandInteraction_VMD', 
-           'calcHydrogenBondsTrajectory', 'calcHydrophobicOverlapingAreas',
+           'calcHydrophobicOverlapingAreas',
            'Interactions', 'InteractionsTrajectory', 'LigandInteractionsTrajectory',
            'calcSminaBindingAffinity', 'calcSminaPerAtomInteractions', 'calcSminaTermValues',
-           'showSminaTermValues', 'getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 'getChannelParameters', 'getChannelAtoms', 'showChannels', 'showCavities']
+           'showSminaTermValues', 'showPairEnergy', 'checkNonstandardResidues',
+           'saveInteractionsAsDummyAtoms', 'createFoldseekAlignment', 'runFoldseek', 'runDali', 
+           'runBLAST', 'extractMultiModelPDB', 'calcSignatureInteractions']
 
 
 def cleanNumbers(listContacts):
@@ -120,36 +128,430 @@ def get_permutation_from_dic(dictionary, key):
 
 
 def filterInteractions(list_of_interactions, atoms, **kwargs):
-    """Return interactions based on selection."""
+    """Return interactions based on *selection* and *selection2*."""
     
+    if 'selection1' in kwargs:
+        kwargs['selection'] = kwargs['selection1']
+
     if 'selection' in kwargs:
+        selection = atoms.select(kwargs['selection'])
+        if selection is None:
+            LOGGER.warn('selection did not work, so no filtering is performed')
+            return list_of_interactions
+
+        ch1 = selection.getChids()
+        x1 = selection.getResnames()
+        y1 = selection.getResnums()
+        listOfselection = np.unique(list(map(lambda x1, y1, ch1: (ch1, x1 + str(y1)),
+                                             x1, y1, ch1)),
+                                    axis=0)
+        listOfselection = [list(i) for i in listOfselection] # needed for in check to work
+
         if 'selection2' in kwargs:
-            if not 'chid' in kwargs['selection'] and not 'chain' in kwargs['selection']:
-                LOGGER.warn('selection does not include chid or chain, so no filtering is performed')
+            selection2 = atoms.select(kwargs['selection2'])
+            if selection2 is None:
+                LOGGER.warn('selection2 did not work, so no filtering is performed')
                 return list_of_interactions
+            
+            ch2 = selection2.getChids()
+            x2 = selection2.getResnames()
+            y2 = selection2.getResnums()
+            listOfselection2 = np.unique(list(map(lambda x2, y2, ch2: (ch2, x2 + str(y2)),
+                                                  x2, y2, ch2)),
+                                         axis=0)
+            listOfselection2 = [list(i) for i in listOfselection2] # needed for in check to work
 
-            if not 'chid' in kwargs['selection2'] and not 'chain' in kwargs['selection2']:
-                LOGGER.warn('selection2 does not include chid or chain, so no filtering is performed')
-                return list_of_interactions
-
-            ch1 = kwargs['selection'].split()[-1] 
-            ch2 = kwargs['selection2'].split()[-1] 
-            final = [i for i in list_of_interactions if (i[2] == ch1 and i[5] == ch2) or (i[5] == ch1 and i[2] == ch2)]
+            final = [i for i in list_of_interactions if (([i[2], i[0]] in listOfselection)
+                                                         and ([i[5], i[3]] in listOfselection2)
+                                                         or ([i[2], i[0]] in listOfselection2)
+                                                         and ([i[5], i[3]] in listOfselection))]
         else:
-            p = atoms.select('same residue as protein within 10 of ('+kwargs['selection']+')')
-            if p is None:
-                LOGGER.warn('selection did not work, so no filtering is performed')
-                return list_of_interactions
+            final = [i for i in list_of_interactions
+                     if (([i[2], i[0]] in listOfselection)
+                         or ([i[5], i[3]] in listOfselection))]
 
-            x = p.select(kwargs['selection']).getResnames()
-            y = p.select(kwargs['selection']).getResnums()
-            listOfselection = np.unique(list(map(lambda x, y: x + str(y), x, y)))
-            final = [i for i in list_of_interactions if i[0] in listOfselection or i[3] in listOfselection]
     elif 'selection2' in kwargs:
         LOGGER.warn('selection2 by itself is ignored')
+        final = list_of_interactions
     else:
         final = list_of_interactions
     return final
+
+
+def get_energy(pair, source):
+    """Return energies based on the pairs of interacting residues (without distance criteria)
+    Taking information from tabulated_energies.txt file"""
+
+    import numpy as np
+    import importlib.resources as pkg_resources    
+    
+    aa_correction = {
+        # Histidine (His)
+        'HSD': 'HIS',   # NAMD, protonated at ND1 (HID in AMBER)
+        'HSE': 'HIS',   # NAMD, protonated at NE2 (HIE in AMBER)
+        'HSP': 'HIS',   # NAMD, doubly protonated (HIP in AMBER)
+        'HID': 'HIS',   # AMBER name, protonated at ND1
+        'HIE': 'HIS',   # AMBER name, protonated at NE2
+        'HIP': 'HIS',   # AMBER name, doubly protonated
+        'HISD': 'HIS',  # GROMACS: protonated at ND1
+        'HISE': 'HIS',  # GROMACS: protonated at NE2
+        'HISP': 'HIS',  # GROMACS: doubly protonated
+
+        # Cysteine (Cys)
+        'CYX': 'CYS',   # Cystine (disulfide bridge)
+        'CYM': 'CYS',   # Deprotonated cysteine, anion
+
+        # Aspartic acid (Asp)
+        'ASH': 'ASP',   # Protonated Asp
+        'ASPP': 'ASP',
+
+        # Glutamic acid (Glu)
+        'GLH': 'GLU',   # Protonated Glu
+        'GLUP': 'GLU',  # Protonated Glu
+
+        # Lysine (Lys)
+        'LYN': 'LYS',   # Deprotonated lysine (neutral)
+
+        # Arginine (Arg)
+        'ARN': 'ARG',   # Deprotonated arginine (rare, GROMACS)
+
+        # Tyrosine (Tyr)
+        'TYM': 'TYR',   # Deprotonated tyrosine (GROMACS)
+
+        # Serine (Ser)
+        'SEP': 'SER',   # Phosphorylated serine (GROMACS/AMBER)
+
+        # Threonine (Thr)
+        'TPO': 'THR',   # Phosphorylated threonine (GROMACS/AMBER)
+
+        # Tyrosine (Tyr)
+        'PTR': 'TYR',   # Phosphorylated tyrosine (GROMACS/AMBER)
+
+        # Non-standard names for aspartic and glutamic acids in low pH environments
+        'ASH': 'ASP',   # Protonated Asp
+        'GLH': 'GLU',   # Protonated Glu
+    }
+    
+    pair = [aa_correction.get(aa, aa) for aa in pair]    
+    
+    if PY3K:
+        with pkg_resources.path('prody.proteins', 'tabulated_energies.txt') as file_path:
+            with open(file_path) as f:
+                data = np.loadtxt(f, dtype=str)
+    else:
+        file_path = pkg_resources.resource_filename('prody.proteins', 'tabulated_energies.txt')
+        with open(file_path) as f:
+            data = np.loadtxt(f, dtype=str)
+    
+    sources = ["IB_nosolv", "IB_solv", "CS"]
+    aa_pairs = []
+    
+    for row in data:
+        aa_pairs.append(row[0]+row[1])
+    
+    lookup = pair[0]+pair[1]
+    
+    try:
+        data_results = data[np.nonzero(np.array(aa_pairs)==lookup)[0]][0][2:][sources.index(source)]
+    except TypeError:
+        raise TypeError('Please replace non-standard names of residues with standard names.')
+
+    return data_results
+
+
+def checkNonstandardResidues(atoms):
+    """Check whether the atomic structure contains non-standard residues and inform to replace the name
+    to the standard one so that non-standard residues are treated in a correct way while computing
+    interactions.
+    
+    :arg atoms: an Atomic object from which residues are selected
+    :type atoms: :class:`.Atomic`
+    """
+
+    try:
+        coords = (atoms._getCoords() if hasattr(atoms, '_getCoords') else
+                    atoms.getCoords())
+    except AttributeError:
+        try:
+            checkCoords(coords)
+        except TypeError:
+            raise TypeError('coords must be an object '
+                            'with `getCoords` method')
+    
+    amino_acids = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLU", "GLN", "GLY", "HIS", "ILE", 
+                   "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]
+
+    aa_list = atoms.select('name CA').getResnames()
+    aa_list_nr = atoms.select('name CA').getResnums()
+    nonstandard = []
+    
+    for nr_i,i in enumerate(aa_list):
+        if i not in amino_acids:
+            nonstandard.append(aa_list[nr_i] + str(aa_list_nr[nr_i]))
+    
+    if len(nonstandard) > 0:
+        LOGGER.info('There are several non-standard residues in the structure.')
+        LOGGER.info('Replace the non-standard name in the PDB file with the equivalent name from the standard one if you want to include them in the interactions.')
+        LOGGER.info("Residues: {0}.".format(' '.join(nonstandard)))
+        return True
+
+    return False
+
+
+def showPairEnergy(data, **kwargs):
+    """Return energies when a list of interactions is given. Energies will be added to each pair of residues 
+    at the last position in the list. Energy is based on the residue types and not on the distances.
+    The unit of energy is kcal/mol. The energies defined as 'IB_nosolv' (non-solvent-mediated) and
+    'IB_solv' (solvent-mediated) are taken from [OK98]_ and 'CS' from InSty paper (under preparation).
+    Protonation of residues is not distinguished. The protonation of residues is not distinguished. 
+    'IB_solv' and 'IB_nosolv' have RT units and 'CS' has units of kcal/mol.
+
+    Known residues such as HSD, HSE, HIE, and HID (used in MD simulations) are treated as HIS.
+    
+    :arg data: list with interactions from calcHydrogenBonds() or other types
+    :type data: list
+    
+    :arg energy_list_type: name of the list with energies 
+                            default is 'IB_solv'
+    :type energy_list_type: 'IB_nosolv', 'IB_solv', 'CS'
+    
+    
+    .. [OK98] Keskin O., Bahar I., Badretdinov A.Y., Ptitsyn O.B., Jernigan R.L., 
+    Empirical solvet-mediated potentials hold for both intra-molecular and 
+    inter-molecular inter-residues interactions,
+    *Protein Science* **1998** 7: 2578–2586.
+    """
+    
+    if not isinstance(data, list):
+        raise TypeError('list_of_interactions must be a list of interactions.')
+
+    energy_list_type = kwargs.pop('energy_list_type', 'IB_solv')
+    
+    for i in data:
+        energy = get_energy([i[0][:3], i[3][:3]], energy_list_type)
+        i.append(float(energy))
+        
+    return data
+
+
+# SignatureInteractions supporting functions
+def remove_empty_strings(row):
+    """Remove empty strings from a list."""
+    return [elem for elem in row if elem != '']
+
+def log_message(message, level="INFO"):
+    """Log a message with a specified log level."""
+    LOGGER.info("[{}] {}".format(level, message))
+
+def is_module_installed(module_name):
+    """Check if a Python module is installed."""
+    import importlib.util
+    spec = importlib.util.find_spec(module_name)
+    return spec is not None
+
+def is_command_installed(command):
+    """Check if a command-line tool is installed."""
+    import shutil
+    return shutil.which(command) is not None
+
+def load_residues_from_pdb(pdb_file):
+    """Extract residue numbers and their corresponding one-letter amino acid codes from a PDB file."""
+    from prody.atomic.atomic import AAMAP
+    structure = parsePDB(pdb_file)
+    residues = structure.iterResidues()
+    residue_dict = {}
+
+    for res in residues:
+        resnum = res.getResnum()
+        resname = res.getResname()  # Three-letter amino acid code
+        try:
+            one_letter_code = AAMAP[resname]
+            residue_dict[resnum] = one_letter_code
+        except KeyError:
+            log_message("Unknown residue: {} at position {}".format(resname, resnum), "WARNING")
+            
+    return residue_dict
+
+def append_residue_code(residue_num, residue_dict):
+    """Return a string with one-letter amino acid code and residue number."""
+    aa_code = residue_dict.get(residue_num, "X")  # Use "X" for unknown residues
+    return "{}{}".format(aa_code, residue_num)
+
+def process_data(mapping_file, pdb_folder, interaction_func, bond_type, files_for_analysis):
+    """Process the mapping file and the PDB folder to compute interaction counts and percentages."""
+    log_message("Loading mapping file: {}".format(mapping_file))
+
+    # Load and clean the mapping file
+    try:
+        mapping = np.loadtxt(mapping_file, delimiter=' ', dtype=str)
+    except Exception as e:
+        log_message("Error loading mapping file: {}".format(e), "ERROR")
+        return None
+
+    mapping = np.where(mapping == '-', np.nan, mapping)
+    filtered_mapping = np.array([remove_empty_strings(row) for row in mapping])
+    mapping_num = filtered_mapping.astype(float)
+
+    # Load the one-letter amino acid codes from model1.pdb
+    import os 
+    pdb_model_path = os.path.join(pdb_folder, 'model1.pdb')
+    residue_dict = load_residues_from_pdb(pdb_model_path)
+
+    log_message("Processing PDB files in folder: {}".format(pdb_folder))
+
+    tar_bond_ind = []
+    processed_files = 0  # To track the number of files successfully processed
+    fixed_files = []  # Store paths of fixed files to remove at the end
+
+    for i, files in enumerate(files_for_analysis):
+        log_message("Processing file {}: {}".format(i + 1, files))
+        
+        try:
+            coords = parsePDB(files)
+            atoms = coords.select('protein')
+            bonds = interaction_func(atoms)
+            saveInteractionsAsDummyAtoms(atoms, bonds, filename=files.rstrip(files.split('/')[-1])+'INT_'+bond_type+'_'+files.split('/')[-1])
+        except Exception as e:
+            log_message("Error processing PDB file {}: {}".format(files, e), "ERROR")
+            continue
+
+        # If no bonds were found, skip this file
+        if len(bonds) == 0:
+            log_message("No {} found in file {}, skipping.".format(bond_type, files), "WARNING")
+            continue
+
+        processed_files += 1  # Increment successfully processed files
+        fixed_files.append(files)
+
+        if processed_files == 1:  # First valid file with bonds determines target indices
+            for entries in bonds:
+                ent = list(np.sort((int(entries[0][3:]), int(entries[3][3:]))))  # Ensure integers
+                tar_bond_ind.append(ent)
+            tar_bond_ind = np.unique(np.array(tar_bond_ind), axis=0).astype(int)
+            count = np.zeros(tar_bond_ind.shape[0], dtype=int)
+
+        bond_ind = []
+        for entries in bonds:
+            ent = list(np.sort((int(entries[0][3:]), int(entries[3][3:]))))  # Ensure integers
+            bond_ind.append(ent)
+        bond_ind = np.unique(np.array(bond_ind), axis=0)
+
+        # Ensure bond_ind is a 2D array
+        if bond_ind.ndim == 1:
+            bond_ind = bond_ind.reshape(-1, 2)  # Reshape to (n, 2) if it's 1D
+
+        for j, pairs in enumerate(tar_bond_ind):
+            ind1_matches = np.where(mapping_num[0] == pairs[0])[0]
+            ind2_matches = np.where(mapping_num[0] == pairs[1])[0]
+
+            if ind1_matches.size > 0 and ind2_matches.size > 0:
+                if processed_files - 1 < mapping_num.shape[0]:
+                    ind1 = mapping_num[processed_files - 1, ind1_matches[0]]
+                    ind2 = mapping_num[processed_files - 1, ind2_matches[0]]
+
+                    if not (np.isnan(ind1) or np.isnan(ind2)):
+                        index = np.where(np.logical_and(bond_ind[:, 0] == int(ind1), bond_ind[:, 1] == int(ind2)))[0]
+                        if index.size != 0:
+                            count[j] += 1
+                else:
+                    log_message("Skipping file {} due to index out of bounds error".format(files), "WARNING")
+            else:
+                log_message("No matching indices found for {} in {}".format(pairs, files), "WARNING")
+
+    # If no files were successfully processed or no bonds were found
+    if processed_files == 0 or len(tar_bond_ind) == 0:
+        log_message("No valid {} entries found across all PDB files.".format(bond_type), "ERROR")
+        return None
+
+    count_reshaped = count.reshape(-1, 1)
+    count_normalized = (count / processed_files * 100).reshape(-1, 1)
+
+    # Modify tar_bond_ind to append the amino acid code before residue index
+    tar_bond_with_aa = []
+    for bond in tar_bond_ind:
+        res1 = append_residue_code(bond[0], residue_dict)  # Append AA code for Res1
+        res2 = append_residue_code(bond[1], residue_dict)  # Append AA code for Res2
+        tar_bond_with_aa.append([res1, res2])
+
+    tar_bond_with_aa = np.array(tar_bond_with_aa)
+
+    # Combine tar_bond_with_aa with count and percentage
+    output_data = np.hstack((tar_bond_with_aa, count_reshaped, count_normalized))
+
+    log_message("Finished processing {} PDB files.".format(processed_files))
+    output_filename = '{}_consensus.txt'.format(bond_type)
+
+    # Save the result with amino acid codes and numeric values
+    np.savetxt(output_filename, output_data, fmt='%s %s %s %s', delimiter=' ', 
+           header='Res1 Res2 Count Percentage', comments='')
+
+    return output_data, fixed_files  # Return fixed_files to remove later
+
+
+def plot_barh(result, bond_type, **kwargs):
+    """Plot horizontal bar plots of percentages of interactions, splitting the data into fixed-sized plots.
+
+    :arg n_per_plot: The number of results per one plot
+        Default is 20 if set to None 
+    :type n_per_plot: int
+    
+    :arg min_height: Size of the bar plot
+        Default is 8
+    :type min_height: int
+    """
+
+    import matplotlib.pylab as plt
+    plt.rcParams.update({'font.size': 20})
+
+    n_per_plot = kwargs.pop('n_per_plot', None)
+    min_height = kwargs.pop('min_height', 8)
+    
+    if n_per_plot is None:
+        n_per_plot = 20
+
+    # Error handling if result is None or empty
+    if result is None or len(result) == 0:
+        log_message("Skipping plot for {} due to insufficient data.".format(bond_type), "ERROR")
+        return
+
+    num_entries = result.shape[0]
+    num_plots = (num_entries + n_per_plot - 1) // n_per_plot  # Number of plots required
+
+    for plot_idx in range(num_plots):
+        # Slice the data for the current plot (take the next 'n_per_plot' entries)
+        start_idx = plot_idx * n_per_plot
+        end_idx = min((plot_idx + 1) * n_per_plot, num_entries)
+        result_chunk = result[start_idx:end_idx]
+
+        log_message("Plotting entries {} to {} for {}.".format(start_idx + 1, end_idx, bond_type))
+        # Use residue numbers for y-axis labels
+        y_labels = ["{}-{}".format(str(row[0]), str(row[1])) for row in result_chunk]
+        percentage_values = result_chunk[:, 3].astype('float')
+
+        norm = plt.Normalize(vmin=0, vmax=100)
+        cmap = plt.cm.get_cmap('coolwarm')
+
+        # Set the figure height with a minimum height of `min_height` for small datasets
+        fig_height = max(min_height, len(result_chunk) * 0.4)
+        plt.figure(figsize=(18, fig_height))
+        bars = plt.barh(y_labels, percentage_values, color=cmap(norm(percentage_values)))
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+
+        # Adjust color bar height to match the number of entries
+        plt.colorbar(sm, label='Percentage', fraction=0.02, pad=0.04)
+
+        plt.ylim(-1, result_chunk.shape[0])
+        plt.ylabel('{} Pairs of Residue Numbers'.format(bond_type))
+        plt.xlabel('Percentage')
+        plt.title('Persistence of {} (entries {}-{})'.format(bond_type, start_idx + 1, end_idx))
+        # Save each plot with an incremented filename for multiple plots
+        output_plot_file = '{}_plot_part{}.png'.format(bond_type, plot_idx + 1)
+        log_message("Saving plot to: {}".format(output_plot_file))
+        plt.savefig(output_plot_file)
+        plt.close()
+        log_message("Plot saved successfully.")
 
 
 def calcHydrophobicOverlapingAreas(atoms, **kwargs):
@@ -233,15 +635,15 @@ def calcSASA(atoms, **kwargs):
     :type atoms: :class:`.Atomic`
     
     :arg selection: selection string
-        by default all the protein structure is used
+        Default all the protein structure is used
     :type selection: str
     
     :arg sasa_cutoff: cutoff for SASA values
-        default is 0.0
+        Default is 0.0
     :type sasa_cutoff: float, int
 
     :arg resnames: residues name included
-        default is False
+        Default is False
     :type resnames: bool    
     """
     
@@ -291,19 +693,19 @@ def calcVolume(atoms, **kwargs):
     :type atoms: :class:`.Atomic`
     
     :arg selection: selection string
-        by default all the protein structure is used
+        Default all the protein structure is used
     :type selection: str
     
     :arg volume_cutoff: cutoff for volume
-        default is 0.0 to include all the results
+        Default is 0.0 to include all the results
     :type sasa_volume: float, int
 
     :arg split_residues: it will provide values for each residue
-        default is False
+        Default is False
     :type split_residues: bool
 
     :arg resnames: residues name included
-        default is False
+        Default is False
         True - will give residue names and values for each residue
         False - will give only the values for each residues
     :type resnames: bool
@@ -365,7 +767,7 @@ def calcHydrogenBonds(atoms, **kwargs):
     
     :arg angleDHA: non-zero value, maximal (180 - D-H-A angle) (donor, hydrogen, acceptor).
         default is 40.
-        angle also works
+        angle and angleDA also work
     :type angleDHA: int, float
     
     :arg seq_cutoff_HB: non-zero value, interactions will be found between atoms with index differences
@@ -419,6 +821,7 @@ def calcHydrogenBonds(atoms, **kwargs):
     distA = kwargs.pop('distA', distDA)
 
     angleDHA = kwargs.pop('angleDA', 40)
+    angleDHA = kwargs.pop('angleDHA', angleDHA)
     angle = kwargs.pop('angle', angleDHA)
     
     seq_cutoff_HB = kwargs.pop('seq_cutoff_HB', 25)
@@ -553,9 +956,11 @@ def calcChHydrogenBonds(atoms, **kwargs):
     
         ChainsHBs = [ i for i in HBS_calculations if str(i[2]) != str(i[5]) ]
         if not ChainsHBs:
-            ligand_name = list(set(atoms.select('all not protein and not ion').getResnames()))[0]
-            ChainsHBs = [ ii for ii in HBS_calculations if ii[0][:3] == ligand_name or ii[3][:3] == ligand_name ]
-        
+            ligand_sel = atoms.select('all not protein and not ion')
+            if ligand_sel:
+                ligand_name = list(set(ligand_sel.getResnames()))[0]
+                ChainsHBs = [ ii for ii in HBS_calculations if ii[0][:3] == ligand_name or ii[3][:3] == ligand_name ]
+
         return ChainsHBs 
         
 
@@ -600,6 +1005,10 @@ def calcSaltBridges(atoms, **kwargs):
     distA = kwargs.pop('distA', distSB)
 
     atoms_KRED = atoms.select('protein and ((resname ASP GLU LYS ARG and not backbone and not name OXT NE "C.*" and noh) or (resname HIS HSE HSD HSP and name NE2))')
+    if atoms_KRED is None:
+        LOGGER.warn('There are no side chain heavy atoms for residues K, R, E, D and H, so not salt bridges are calculated')
+        return []
+
     charged_residues = list(set(zip(atoms_KRED.getResnums(), atoms_KRED.getChids())))
     
     LOGGER.info('Calculating salt bridges.')
@@ -806,11 +1215,11 @@ def calcPiStacking(atoms, **kwargs):
     distPS = kwargs.pop('distPS', 5.0)
     distA = kwargs.pop('distA', distPS)
 
-    angle_min_RB = kwargs.pop('angle_min_RB', 0)
-    angle_min = kwargs.pop('angle_min', angle_min_RB)
+    angle_min_PS = kwargs.pop('angle_min_PS', 0)
+    angle_min = kwargs.pop('angle_min', angle_min_PS)
 
-    angle_max_RB = kwargs.pop('angle_max_RB', 360)
-    angle_max = kwargs.pop('angle_max', angle_max_RB)
+    angle_max_PS = kwargs.pop('angle_max_PS', 360)
+    angle_max = kwargs.pop('angle_max', angle_max_PS)
     
     non_standard_PS = kwargs.get('non_standard_PS', {})
     non_standard = kwargs.get('non_standard', non_standard_PS)
@@ -844,7 +1253,7 @@ def calcPiStacking(atoms, **kwargs):
                                    str(sele2.getResnames()[0])+str(sele2.getResnums()[0]), '_'.join(map(str,sele2.getIndices())), str(sele2.getChids()[0])]])
 
     # create a process pool that uses all cpus
-    with multiprocessing.Pool() as pool:
+    with mp.Pool() as pool:
         # call the function for each item in parallel with multiple arguments
         for result in pool.starmap(calcPiStacking_once, items):
             if result is not None:
@@ -1088,42 +1497,41 @@ def calcHydrophobic(atoms, **kwargs):
         if sele2 != None:
             sele2_nr = list(set(zip(sele2.getResnums(), sele2.getChids())))
 
-            if sele1_name[0] in aromatic:
-                # avoid double counting pi stacking and don't include same residue interactions
-                sele2_filter = sele2.select('all and not (resname TYR PHE TRP or resid '+str(i[0])+' and chain '+i[1]+')')
+            for (resnum, chid) in sele2_nr:
+                sele2_filter = sele2.select('resnum {0} and chid {1}'.format(resnum, chid))
+
+                if sele1_name[0] in aromatic:
+                    # avoid double counting pi stacking and don't include same residue interactions
+                    sele2_filter = sele2_filter.select('all and not (resname TYR PHE TRP or resid '+str(i[0])+' and chain '+i[1]+')')
+                elif sele1_name[0] not in aromatic and i in sele2_nr:
+                    # don't include same residue interactions but don't worry about double counting pi stacking
+                    sele2_filter = sele2_filter.select(sele2.select('all and not (resid '+str(i[0])+' and chain '+i[1]+')'))
+
                 if sele2_filter != None:
                     listOfAtomToCompare = cleanNumbers(findNeighbors(sele1, distA, sele2_filter))
-                
-            elif sele1_name[0] not in aromatic and i in sele2_nr:
-                # don't include same residue interactions but don't worry about double counting pi stacking
-                sele2_filter = sele2.select(sele2.select('all and not (resid '+str(i[0])+' and chain '+i[1]+')'))
-                if sele2_filter != None:
-                    listOfAtomToCompare = cleanNumbers(findNeighbors(sele1, distA, sele2_filter))
-            else:
-                listOfAtomToCompare = cleanNumbers(findNeighbors(sele1, distA, sele2))
-                                                           
-            if listOfAtomToCompare != []:
-                listOfAtomToCompare = sorted(listOfAtomToCompare, key=lambda x : x[-1])
-                minDistancePair = listOfAtomToCompare[0]
-                if minDistancePair[-1] < distA:
-                    sele1_new = atoms.select('index '+str(minDistancePair[0])+' and name '+str(minDistancePair[2]))
-                    sele2_new = atoms.select('index '+str(minDistancePair[1])+' and name '+str(minDistancePair[3]))
-                    residue1 = sele1_new.getResnames()[0]+str(sele1_new.getResnums()[0]) 
-                    residue2 = sele2_new.getResnames()[0]+str(sele2_new.getResnums()[0])
-                    try:
-                        Hydrophobic_calculations.append([residue1, 
-                                                    minDistancePair[2]+'_'+str(minDistancePair[0]), sele1_new.getChids()[0],
-                                                    residue2, 
-                                                    minDistancePair[3]+'_'+str(minDistancePair[1]), sele2_new.getChids()[0],
-                                                    round(minDistancePair[-1],4),
-                                                    round(get_permutation_from_dic(hpb_overlaping_results,(residue1+sele1_new.getChids()[0],
-                                                    residue2+sele2_new.getChids()[0])),4)])
-                    except:
-                        Hydrophobic_calculations.append([residue1, 
-                                                    minDistancePair[2]+'_'+str(minDistancePair[0]), sele1_new.getChids()[0],
-                                                    residue2, 
-                                                    minDistancePair[3]+'_'+str(minDistancePair[1]), sele2_new.getChids()[0],
-                                                    round(minDistancePair[-1],4)])                         
+
+                if listOfAtomToCompare != []:
+                    listOfAtomToCompare = sorted(listOfAtomToCompare, key=lambda x : x[-1])
+                    minDistancePair = listOfAtomToCompare[0]
+                    if minDistancePair[-1] < distA:
+                        sele1_new = atoms.select('index '+str(minDistancePair[0])+' and name '+str(minDistancePair[2]))
+                        sele2_new = atoms.select('index '+str(minDistancePair[1])+' and name '+str(minDistancePair[3]))
+                        residue1 = sele1_new.getResnames()[0]+str(sele1_new.getResnums()[0])
+                        residue2 = sele2_new.getResnames()[0]+str(sele2_new.getResnums()[0])
+                        try:
+                            Hydrophobic_calculations.append([residue1,
+                                                            minDistancePair[2]+'_'+str(minDistancePair[0]), sele1_new.getChids()[0],
+                                                            residue2,
+                                                            minDistancePair[3]+'_'+str(minDistancePair[1]), sele2_new.getChids()[0],
+                                                            round(minDistancePair[-1],4),
+                                                            round(get_permutation_from_dic(hpb_overlaping_results,(residue1+sele1_new.getChids()[0],
+                                                            residue2+sele2_new.getChids()[0])),4)])
+                        except:
+                            Hydrophobic_calculations.append([residue1,
+                                                            minDistancePair[2]+'_'+str(minDistancePair[0]), sele1_new.getChids()[0],
+                                                            residue2,
+                                                            minDistancePair[3]+'_'+str(minDistancePair[1]), sele2_new.getChids()[0],
+                                                            round(minDistancePair[-1],4)])
     
     selection = kwargs.get('selection', None)
     selection2 = kwargs.get('selection2', None) 
@@ -1177,7 +1585,7 @@ def calcDisulfideBonds(atoms, **kwargs):
     :arg atoms: an Atomic object from which residues are selected
     :type atoms: :class:`.Atomic`
     
-    :arg distDB: non-zero value, maximal distance between atoms of hydrophobic residues.
+    :arg distDB: non-zero value, maximal distance between atoms of cysteine residues.
         default is 3.
         distA works too
     :type distDB: int, float
@@ -1198,12 +1606,15 @@ def calcDisulfideBonds(atoms, **kwargs):
     
     from prody.measure import calcDihedral
     
-    try:
-        atoms_SG = atoms.select('protein and resname CYS and name SG')
+    atoms_SG = atoms.select('protein and resname CYS and name SG')
+    DisulfideBonds_list = []
+
+    if atoms_SG is None:
+        LOGGER.info('Lack of cysteines in the structure.')
+    else:
         atoms_SG_res = list(set(zip(atoms_SG.getResnums(), atoms_SG.getChids())))
     
         LOGGER.info('Calculating disulfide bonds.')
-        DisulfideBonds_list = []
         for i in atoms_SG_res:
             CYS_pairs = atoms.select('(same residue as protein within '+str(distA)+' of ('+'resid '+str(i[0])+' and chain '+i[1]+' and name SG)) and (resname CYS and name SG)')
             if CYS_pairs.numAtoms() > 1:
@@ -1223,15 +1634,12 @@ def calcDisulfideBonds(atoms, **kwargs):
                             ' and chain '+str(sele2_new.getChids()[0]))
                         diheAng = calcDihedral(sele1_CB, sele1_new, sele2_new, sele2_CB)
                         DisulfideBonds_list.append([sele1_new.getResnames()[0]+str(sele1_new.getResnums()[0]),
-                                                                minDistancePair[2]+'_'+str(minDistancePair[0]), sele1_new.getChids()[0],
-                                                                sele2_new.getResnames()[0]+str(sele2_new.getResnums()[0]),
-                                                                minDistancePair[3]+'_'+str(minDistancePair[1]), sele2_new.getChids()[0],
-                                                                round(minDistancePair[-1],4), round(float(diheAng),4)])
-    except:
-        atoms_SG = atoms.select('protein and resname CYS')
-        if atoms_SG is None:
-            LOGGER.info('Lack of cysteines in the structure.')
-            DisulfideBonds_list = []
+                                                    minDistancePair[2]+'_'+str(minDistancePair[0]),
+                                                    sele1_new.getChids()[0],
+                                                    sele2_new.getResnames()[0]+str(sele2_new.getResnums()[0]),
+                                                    minDistancePair[3]+'_'+str(minDistancePair[1]),
+                                                    sele2_new.getChids()[0],
+                                                    round(minDistancePair[-1],4), round(float(diheAng),4)])
 
     DisulfideBonds_list_final = removeDuplicates(DisulfideBonds_list)
 
@@ -1296,7 +1704,12 @@ def calcMetalInteractions(atoms, distA=3.0, extraIons=['FE'], excluded_ions=['SO
 
 def calcInteractionsMultipleFrames(atoms, interaction_type, trajectory, **kwargs):
     """Compute selected type interactions for DCD trajectory or multi-model PDB 
-    using default parameters."""
+    using default parameters or those from kwargs.
+
+    :arg max_proc: maximum number of processes to use
+        default is half of the number of CPUs
+    :type max_proc: int
+    """
     
     try:
         coords = getCoords(atoms)
@@ -1310,6 +1723,7 @@ def calcInteractionsMultipleFrames(atoms, interaction_type, trajectory, **kwargs
     interactions_all = []
     start_frame = kwargs.pop('start_frame', 0)
     stop_frame = kwargs.pop('stop_frame', -1)
+    max_proc = kwargs.pop('max_proc', mp.cpu_count()//2)
 
     interactions_dic = {
     "HBs": calcHydrogenBonds,
@@ -1325,8 +1739,9 @@ def calcInteractionsMultipleFrames(atoms, interaction_type, trajectory, **kwargs
         if isinstance(trajectory, Atomic):
             trajectory = Ensemble(trajectory)
         
-        nfi = trajectory._nfi    
-        trajectory.reset()
+        if isinstance(trajectory, Trajectory):
+            nfi = trajectory._nfi
+            trajectory.reset()
         numFrames = trajectory._n_csets
         
         if stop_frame == -1:
@@ -1335,22 +1750,81 @@ def calcInteractionsMultipleFrames(atoms, interaction_type, trajectory, **kwargs
             traj = trajectory[start_frame:stop_frame+1]
         
         atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=start_frame):
+        def analyseFrame(j0, frame0, interactions_all):
             LOGGER.info('Frame: {0}'.format(j0))
             atoms_copy.setCoords(frame0.getCoords())
             protein = atoms_copy.select('protein')
             interactions = interactions_dic[interaction_type](protein, **kwargs)
             interactions_all.append(interactions)
-        trajectory._nfi = nfi
+
+        if max_proc == 1:
+            interactions_all = []
+            for j0, frame0 in enumerate(traj, start=start_frame):
+                analyseFrame(j0, frame0, interactions_all)
+        else:
+            with mp.Manager() as manager:
+                interactions_all = manager.list()
+
+                j0 = start_frame
+                while j0 < traj.numConfs()+start_frame:
+
+                    processes = []
+                    for _ in range(max_proc):
+                        frame0 = traj[j0-start_frame]
+                        
+                        p = mp.Process(target=analyseFrame, args=(j0, frame0,
+                                                                 interactions_all))
+                        p.start()
+                        processes.append(p)
+
+                        j0 += 1
+                        if j0 >= traj.numConfs()+start_frame:
+                            break
+
+                    for p in processes:
+                        p.join()
+
+                interactions_all = interactions_all[:]
+
+        if isinstance(trajectory, Trajectory):
+            trajectory._nfi = nfi
     
     else:
         if atoms.numCoordsets() > 1:
-            for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
+            def analyseFrame(i, interactions_all):
                 LOGGER.info('Model: {0}'.format(i+start_frame))
                 atoms.setACSIndex(i+start_frame)
                 protein = atoms.select('protein')
                 interactions = interactions_dic[interaction_type](protein, **kwargs)
                 interactions_all.append(interactions)
+
+            if stop_frame == -1:
+                stop_frame = atoms.numCoordsets()
+
+            if max_proc == 1:
+                interactions_all = []
+                for i in range(len(atoms.getCoordsets()[start_frame:stop_frame+1])):
+                    analyseFrame(i, interactions_all)
+            else:
+                with mp.Manager() as manager:
+                    interactions_all = manager.list()
+
+                    i = start_frame
+                    while i < len(atoms.getCoordsets()[start_frame:stop_frame+1]):
+                        processes = []
+                        for _ in range(max_proc):
+                            p = mp.Process(target=analyseFrame, args=(i, interactions_all))
+                            p.start()
+                            processes.append(p)
+
+                            i += 1
+                            if i >= len(atoms.getCoordsets()[start_frame:stop_frame]):
+                                break
+
+                        for p in processes:
+                            p.join()
+
+                    interactions_all = interactions_all[:]
         else:
             LOGGER.info('Include trajectory or use multi-model PDB file.')
     
@@ -1358,7 +1832,7 @@ def calcInteractionsMultipleFrames(atoms, interaction_type, trajectory, **kwargs
 
 
 def calcProteinInteractions(atoms, **kwargs):
-    """Compute all protein interactions (shown below) using default parameters.
+    """Compute all protein interactions (shown below).
         (1) Hydrogen bonds
         (2) Salt Bridges
         (3) RepulsiveIonicBonding 
@@ -1366,6 +1840,10 @@ def calcProteinInteractions(atoms, **kwargs):
         (5) Pi-cation interactions
         (6) Hydrophobic interactions
         (7) Disulfide Bonds
+
+    kwargs can be passed on to the underlying functions as described
+    in their documentation. For example, distDA and angleDHA can be used
+    to control hydrogen bonds, or distA and angle can be used across types.
     
     :arg atoms: an Atomic object from which residues are selected
     :type atoms: :class:`.Atomic`
@@ -1392,7 +1870,7 @@ def calcProteinInteractions(atoms, **kwargs):
             raise TypeError('coords must be an object '
                             'with `getCoords` method')
 
-    LOGGER.info('Calculating interations.') 
+    LOGGER.info('Calculating interactions.')
     HBs_calculations = calcHydrogenBonds(atoms.protein, **kwargs)               #1 in counting
     SBs_calculations = calcSaltBridges(atoms.protein, **kwargs)                 #2
     SameChargeResidues = calcRepulsiveIonicBonding(atoms.protein, **kwargs)     #3
@@ -1417,10 +1895,12 @@ def calcHydrogenBondsTrajectory(atoms, trajectory=None, **kwargs):
 
     :arg distA: non-zero value, maximal distance between donor and acceptor.
         default is 3.5
+        distDA also works
     :type distA: int, float
     
     :arg angle: non-zero value, maximal (180 - D-H-A angle) (donor, hydrogen, acceptor).
         default is 40.
+        angleDHA also works
     :type angle: int, float
     
     :arg seq_cutoff: non-zero value, interactions will be found between atoms with index differences
@@ -1461,6 +1941,7 @@ def calcSaltBridgesTrajectory(atoms, trajectory=None, **kwargs):
     :arg distA: non-zero value, maximal distance between center of masses 
         of N and O atoms of negatively and positevely charged residues.
         default is 5.
+        distSB also works
     :type distA: int, float
     
     :arg selection: selection string
@@ -1497,6 +1978,7 @@ def calcRepulsiveIonicBondingTrajectory(atoms, trajectory=None, **kwargs):
     :arg distA: non-zero value, maximal distance between center of masses 
             between N-N or O-O atoms of residues.
             default is 4.5.
+            distRB also works
     :type distA: int, float
 
     :arg selection: selection string
@@ -1533,6 +2015,7 @@ def calcPiStackingTrajectory(atoms, trajectory=None, **kwargs):
     :arg distA: non-zero value, maximal distance between center of masses 
                 of residues aromatic rings.
                 default is 5.
+                distPS also works
     :type distA: int, float
     
     :arg angle_min: minimal angle between aromatic rings.
@@ -1577,6 +2060,7 @@ def calcPiCationTrajectory(atoms, trajectory=None, **kwargs):
     :arg distA: non-zero value, maximal distance between center of masses of aromatic ring 
                 and positively charge group.
                 default is 5.
+                distPC also works
     :type distA: int, float
     
     :arg selection: selection string
@@ -1612,6 +2096,7 @@ def calcHydrophobicTrajectory(atoms, trajectory=None, **kwargs):
     
     :arg distA: non-zero value, maximal distance between atoms of hydrophobic residues.
         default is 4.5.
+        distHPh also works
     :type distA: int, float
 
     :arg selection: selection string
@@ -1644,8 +2129,9 @@ def calcDisulfideBondsTrajectory(atoms, trajectory=None, **kwargs):
     :arg trajectory: trajectory file
     :type trajectory: class:`.Trajectory`
     
-    :arg distA: non-zero value, maximal distance between atoms of hydrophobic residues.
+    :arg distA: non-zero value, maximal distance between atoms of cysteine residues.
         default is 2.5.
+        distDB also works
     :type distA: int, float
 
     :arg start_frame: index of first frame to read
@@ -1731,35 +2217,35 @@ def showInteractionsGraph(statistics, **kwargs):
     :type statistics: list
     
     :arg cutoff: Minimal number of counts per residue in the trajectory
-        by default 0.1.
+        Default is 0.1.
     :type cutoff: int, float
 
     :arg code: representation of the residues, 3-letter or 1-letter
-        by default 3-letter
+        Default is 3-letter
     :type code: str
 
     :arg multiple_chains: display chain name for structure with many chains
-        by default False
+        Default is False
     :type multiple_chains: bool
     
     :arg edge_cmap: color of the residue connection
-        by default plt.cm.Blues (blue color)
+        Default is plt.cm.Blues (blue color)
     :type edge_cmap: str
 
     :arg node_size: size of the nodes which describes residues
-        by default 300
+        Default is 300
     :type node_size: int
     
     :arg node_distance: value which will scale residue-residue interactions
-        by default 5
+        Default is 5
     :type node_distance: int
 
     :arg font_size: size of the font
-        by default 14
+        Default is 14
     :type font_size: int
 
     :arg seed: random number which affect the distribution of residues
-        by default 42
+        Default is 42
     :type seed: int
     """
     
@@ -1815,11 +2301,16 @@ def showInteractionsGraph(statistics, **kwargs):
               'HIS': 'H', 'HSD': 'H','HSE': 'H', 'LEU': 'L', 'ARG': 'R', 'TRP': 'W', 
               'ALA': 'A', 'VAL':'V', 'GLU': 'E', 'TYR': 'Y', 'MET': 'M'}
     
-    if len(statistics[0]) != 4:
-        raise TypeError('data must be a list obtained from calcStatisticsInteractions')
+
+    if isinstance(statistics, int) or isinstance(statistics, str) or isinstance(statistics, Atomic):
+        raise TypeError('input data must be a list, use calcStatisticsInteractions to obtain statistics for a particular interaction type')
+
+    if isinstance(statistics, InteractionsTrajectory) or isinstance(statistics, Interactions):
+        raise TypeError('use calcStatisticsInteractions to obtain statistics for a particular interaction type')
+        
     else:
-        if isinstance(statistics, int) or isinstance(statistics, str):
-            raise TypeError('node_size must be a list')
+        if len(statistics[0]) != 5:
+            raise TypeError('input data must be a list obtained from calcStatisticsInteractions')
 
     code = kwargs.pop('code', None)
     if code is None:
@@ -1883,11 +2374,84 @@ def showInteractionsGraph(statistics, **kwargs):
     return show
     
     
+def showInteractionsHist(statistics, **kwargs):
+    """Return information about residue-residue interactions as a bar plot.
+    
+    :arg statistics: Results obtained from calcStatisticsInteractions analysis
+    :type statistics: list
+    
+    :arg clip: maxmimal number of residue pairs on the bar plot
+        Default is 20
+    :type clip: int
+
+    :arg font_size: size of the font
+        Default is 18
+    :type font_size: int
+    """
+
+    if isinstance(statistics, int) or isinstance(statistics, str) or isinstance(statistics, Atomic):
+        raise TypeError('input data must be a list, use calcStatisticsInteractions to obtain statistics for a particular interaction type')
+
+    if isinstance(statistics, InteractionsTrajectory) or isinstance(statistics, Interactions):
+        raise TypeError('use calcStatisticsInteractions to obtain statistics for a particular interaction type')
+        
+    else:
+        if len(statistics[0]) != 5:
+            raise TypeError('input data must be a list obtained from calcStatisticsInteractions')
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    clip = kwargs.pop('clip', 20)
+    font_size = kwargs.pop('font_size', 18)
+    
+    labels = [row[0] for row in statistics]
+    values = [row[2] for row in statistics]
+    std_devs = [row[3] for row in statistics]
+    colors = [row[1] for row in statistics]
+
+    sorted_indices = np.argsort(colors)[-clip:]
+    labels = [labels[i] for i in sorted_indices]
+    values = [values[i] for i in sorted_indices]
+    std_devs = [std_devs[i] for i in sorted_indices]
+    colors = [colors[i] for i in sorted_indices]
+
+    norm = plt.Normalize(min(colors), max(colors))
+    cmap = plt.get_cmap("Blues")
+    
+    num_labels = len(labels)
+    height = max(6, num_labels * 0.4)
+
+    fig, ax = plt.subplots(figsize=(8, height))
+    bars = ax.barh(labels, values, xerr=std_devs, color=cmap(norm(colors)))
+    
+    for bar in bars:
+        bar.set_edgecolor('black')
+    
+    ax.set_xlabel('Average distance [\u00C5]')
+    
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label='Weight')
+    ax.tick_params(axis='both', labelsize=font_size)
+    plt.tight_layout()
+        
+    if SETTINGS['auto_show']:
+        showFigure()
+    
+    
 def calcStatisticsInteractions(data, **kwargs):
     """Return the statistics of interactions from PDB Ensemble or trajectory including:
     (1) the weight for each residue pair: corresponds to the number of counts divided by the 
-    number of frames (values >1 are obtained when residue pair creates multiple contacts); 
-    (2) average distance of interactions for each pair [in Ang] and (3) standard deviation [Ang.].
+    number of frames (values >1 are obtained when the residue pair creates multiple contacts); 
+    (2) average distance of interactions for each pair [in Ang], 
+    (3) standard deviation [Ang.],
+    (4) Energy [in kcal/mol] that is not distance dependent. Energy by default is solvent-mediated
+    from [OK98]_ ('IB_solv') in RT units. To use non-solvent-mediated (residue-mediated) entries ('IB_nosolv')
+    from [OK98]_ in RT units or solvent-mediated values obtained from MD for InSty paper ('CS', under preparation)
+    in kcal/mol, change `energy_list_type` parameter.
+    If energy information is not available, please check whether the pair of residues is listed in 
+    the "tabulated_energies.txt" file, which is localized in the ProDy directory.
         
     :arg data: list with interactions from calcHydrogenBondsTrajectory() or other types
     :type data: list
@@ -1896,6 +2460,11 @@ def calcStatisticsInteractions(data, **kwargs):
         1 or more means that residue contact is present in all conformations/frames
         default value is 0.2 (in 20% of conformations contact appeared)
     :type weight_cutoff: int, float 
+    
+    :arg energy_list_type: name of the list with energies 
+                            default is 'IB_solv'
+    :type energy_list_type: 'IB_nosolv', 'IB_solv', 'CS'
+
     
     Example of usage: 
     >>> atoms = parsePDB('PDBfile.pdb')
@@ -1911,6 +2480,7 @@ def calcStatisticsInteractions(data, **kwargs):
     
     interactions_list = [ (jj[0]+jj[2]+'-'+jj[3]+jj[5], jj[6]) for ii in data for jj in ii]
     weight_cutoff = kwargs.pop('weight_cutoff', 0.2)
+    energy_list_type = kwargs.pop('energy_list_type', 'IB_solv')
     
     import numpy as np
     elements = [t[0] for t in interactions_list]
@@ -1919,23 +2489,42 @@ def calcStatisticsInteractions(data, **kwargs):
     for element in elements:
         if element not in stats:
             values = [t[1] for t in interactions_list if t[0] == element]
-            stats[element] = {
-                "stddev": np.round(np.std(values),6),
-                "mean": np.round(np.mean(values),6),
-                "weight": np.round(float(len(values))/len(data), 6)
-            }
+            
+            try:
+                stats[element] = {
+                    "stddev": np.round(np.std(values),6),
+                    "mean": np.round(np.mean(values),6),
+                    "weight": np.round(float(len(values))/len(data), 6),
+                    "energy": get_energy([element.split('-')[0][:3], element.split('-')[1][:3]], energy_list_type)
+                }
+            except:
+                LOGGER.warn('energy information is not available for ', element)
+                stats[element] = {
+                    "stddev": np.round(np.std(values),6),
+                    "mean": np.round(np.mean(values),6),
+                    "weight": np.round(float(len(values))/len(data), 6)
+                }
 
     statistic = []
+    unit = 'RT' if energy_list_type in ['IB_solv', 'IB_nosolv'] else 'kcal/mol'
     for key, value in stats.items():
         if float(value['weight']) > weight_cutoff:
             LOGGER.info("Statistics for {0}:".format(key))
             LOGGER.info("  Average [Ang.]: {}".format(value['mean']))
             LOGGER.info("  Standard deviation [Ang.]: {0}".format(value['stddev']))
             LOGGER.info("  Weight: {0}".format(value['weight']))
-            statistic.append([key, value['weight'], value['mean'], value['stddev']])
+            try:
+                LOGGER.info("  Energy [{0}]: {1}".format(unit, value['energy']))
+                statistic.append([key, value['weight'], value['mean'], value['stddev'], value['energy']])
+            except:
+                statistic.append([key, value['weight'], value['mean'], value['stddev']])
         else: pass
     
     statistic.sort(key=lambda x: x[1], reverse=True)
+    
+    if statistic == []:
+        LOGGER.info("No meaningful interactions found. Decrease weight_cutoff to obtain some results (default is 0.2).")
+        
     return statistic
 
 
@@ -2016,6 +2605,80 @@ def calcDistribution(interactions, residue1, residue2=None, **kwargs):
                 LOGGER.info(i)
 
 
+def saveInteractionsAsDummyAtoms(atoms, interactions, filename, **kwargs):
+    '''Creates a PDB file which will contain protein structure and dummy atoms that will be placed between pairs
+    of interacting residues.
+    
+    :arg atoms: an Atomic object from which residues are selected
+    :type atoms: :class:`.Atomic`
+    
+    :arg interactions: list of interactions
+    :type interactions: list
+
+    :arg filename: name of the PDB file which will contain dummy atoms and protein structure
+    :type filename: str 
+    
+    :arg RESNAME_dummy: resname of the dummy atom, use 3-letter name
+                        be default is 'DUM'
+    :type RESNAME_dummy: str '''
+
+
+    try:
+        coords = (atoms._getCoords() if hasattr(atoms, '_getCoords') else
+                    atoms.getCoords())
+    except AttributeError:
+        try:
+            checkCoords(coords)
+        except TypeError:
+            raise TypeError('coords must be an object '
+                            'with `getCoords` method')
+                            
+    RESNAME_dummy = kwargs.pop('RESNAME_dummy', 'DUM')
+    
+    def calcDUMposition(coord1, coord2):
+        midpoint = [
+            (coord1[0] + coord2[0]) / 2,
+            (coord1[1] + coord2[1]) / 2,
+            (coord1[2] + coord2[2]) / 2
+        ]
+        return midpoint
+
+    all_DUMs = []
+    atoms_ = atoms.copy()
+
+    for i in interactions:
+        if len(i[1].split('_')) <= 3:
+            res1_name = 'chain '+i[2]+' and resname '+i[0][:3]+' and resid '+i[0][3:]+' and index '+' '.join(i[1].split('_')[1:])
+            res1_coords = calcCenter(atoms.select(res1_name))  
+        
+        if len(i[1].split('_')) > 3:
+            res1_name = 'chain '+i[2]+' and resname '+i[0][:3]+' and resid '+i[0][3:]+' and index '+' '.join(i[1].split('_'))
+            res1_coords = calcCenter(atoms.select(res1_name))
+
+        if len(i[4].split('_')) <= 3:
+            res2_name = 'chain '+i[5]+' and resname '+i[3][:3]+' and resid '+i[3][3:]+' and index '+' '.join(i[4].split('_')[1:])
+            res2_coords = calcCenter(atoms.select(res2_name))
+            
+        if len(i[4].split('_')) > 3:     
+            res2_name = 'chain '+i[5]+' and resname '+i[3][:3]+' and resid '+i[3][3:]+' and index '+' '.join(i[4].split('_'))
+            res2_coords = calcCenter(atoms.select(res2_name))
+
+        all_DUMs.append(calcDUMposition(res1_coords, res2_coords))
+    
+    if all_DUMs == []:
+        LOGGER.info('Lack of interactions')
+    else:
+        LOGGER.info('Creating file with dummy atoms')
+        dummyAtoms = AtomGroup()
+        coords = array([all_DUMs], dtype=float)
+        dummyAtoms.setCoords(coords)
+        dummyAtoms.setNames([RESNAME_dummy]*len(dummyAtoms))
+        dummyAtoms.setResnums(range(1, len(dummyAtoms)+1))
+        dummyAtoms.setResnames([RESNAME_dummy]*len(dummyAtoms))
+
+        writePDB(filename, atoms_+dummyAtoms)
+
+
 def listLigandInteractions(PLIP_output, **kwargs):
     """Create a list of interactions from PLIP output created using calcLigandInteractions().
     Results can be displayed in VMD. 
@@ -2025,7 +2688,7 @@ def listLigandInteractions(PLIP_output, **kwargs):
     
     :arg output: parameter to print the interactions on the screen
                  while analyzing the structure (True | False)
-                 by default is False
+                 Default is False
     :type output: bool     
     
     Note that five types of interactions are considered: hydrogen bonds, salt bridges, 
@@ -2179,6 +2842,86 @@ def calcLigandInteractions(atoms, **kwargs):
         LOGGER.info("Ligand not found.")
 
 
+def showProteinInteractions(atoms, interactions, color='red',**kwargs):
+    """Display protein interactions in an inline py3Dmol viewer.
+    
+    Different types of interactions can be saved separately (color can be selected) 
+    or all at once for all types of interactions (hydrogen bonds - blue, salt bridges - yellow,
+    pi stacking - green, cation-pi - orangem, hydrophobic - silver, and disulfide bonds - black).
+
+    kwargs are passed on to showProtein
+    
+    :arg atoms: an Atomic object from which residues are selected
+    :type atoms: :class:`.Atomic`
+    
+    :arg interactions: List of interactions for protein interactions.
+    :type interactions: List of lists
+    
+    :arg color: color to draw interactions ,
+                 used only for single interaction type.
+                default **"red"**
+    :type color: str
+    """    
+
+    import sys        
+    if 'py3Dmol' not in sys.modules: 
+            LOGGER.warn('py3Dmol not loaded. No visualization will be displayed.')
+            return None
+
+    try:
+        coords = (atoms._getCoords() if hasattr(atoms, '_getCoords') else
+                    atoms.getCoords())
+    except AttributeError:
+        try:
+            checkCoords(coords)
+        except TypeError:
+            raise TypeError('coords must be an object '
+                            'with `getCoords` method')
+
+    if not isinstance(interactions, list):
+        raise TypeError('interactions must be a list of interactions.')
+    
+    view = showProtein(atoms, **kwargs);
+    view.addStyle({'stick':{'radius':0.1}})
+
+    def singleInteraction(view, interaction, color='blue'):
+        """Creates cylinders for the interactions.
+        """
+        
+        for nr_i,i in enumerate(interaction):
+            try:
+                at1 = atoms.select('index '+' '.join([k for k in i[1].split('_') if k.isdigit() ] ))
+                at1xyz = calcCenter(at1.getCoords())
+                at2 = atoms.select('index '+' '.join([kk for kk in i[4].split('_') if kk.isdigit() ] ))
+                at2xyz = calcCenter(at2.getCoords())
+                            
+                view.addCylinder({'start':{'x':at1xyz[0],'y':at1xyz[1],'z':at1xyz[2]},
+                              'end':{'x':at2xyz[0],'y':at2xyz[1],'z':at2xyz[2]},
+                              'dashed': True,
+                              'color':color});
+
+            except: LOGGER.info("There was a problem.")
+     
+    if len(interactions) == 7 and isinstance(interactions[0][0], list):
+        # For all seven types of interactions at once
+        # HBs_calculations, SBs_calculations, SameChargeResidues, Pi_stacking, Pi_cation, Hydroph_calculations, Disulfide Bonds
+        colors = ['blue', 'yellow', 'red', 'green', 'orange', 'silver', 'black']
+        
+        for nr_inter,inter in enumerate(interactions):
+            singleInteraction(view, inter, color=colors[nr_inter])
+
+    elif interactions == []:
+        LOGGER.info("Lack of results")
+
+    elif len(interactions[0]) == 0:
+        LOGGER.info("Lack of results")
+        
+    else:
+        singleInteraction(view,interactions,color)
+
+    return view
+
+
 def showProteinInteractions_VMD(atoms, interactions, color='red',**kwargs):
     """Save information about protein interactions to a TCL file (filename)
     which can be further use in VMD to display all intercations in a graphical interface
@@ -2261,7 +3004,7 @@ def showProteinInteractions_VMD(atoms, interactions, color='red',**kwargs):
                 tcl_file.write('mol addrep 0 \n')
             except: LOGGER.info("There was a problem.")
      
-    if len(interactions) == 7:   
+    if len(interactions) == 7 and isinstance(interactions[0][0], list):
         # For all seven types of interactions at once
         # HBs_calculations, SBs_calculations, SameChargeResidues, Pi_stacking, Pi_cation, Hydroph_calculations, Disulfide Bonds
         colors = ['blue', 'yellow', 'red', 'green', 'orange', 'silver', 'black']
@@ -2281,6 +3024,62 @@ def showProteinInteractions_VMD(atoms, interactions, color='red',**kwargs):
     tcl_file.write('draw materials off')
     tcl_file.close()   
     LOGGER.info("TCL file saved")
+
+def showLigandInteraction(atoms, interactions, **kwargs):
+    """Display information from PLIP for ligand-protein interactions in a py3dmol viewer.
+    
+    :arg atoms: an Atomic object from which residues are selected
+    :type atoms: :class:`.Atomic`
+    
+    :arg interactions: List of interactions lists for protein-ligand interactions.
+    :type interactions: list       
+
+    To obtain protein-ligand interactions:
+    >>> calculations = calcLigandInteractions(atoms)
+    >>> interactions = listLigandInteractions(calculations) """
+
+    import sys        
+    if 'py3Dmol' not in sys.modules: 
+            LOGGER.warn('py3Dmol not loaded. No visualization will be displayed.')
+            return None
+
+    try:
+        coords = (atoms._getCoords() if hasattr(atoms, '_getCoords') else
+                    atoms.getCoords())
+    except AttributeError:
+        try:
+            checkCoords(coords)
+        except TypeError:
+            raise TypeError('coords must be an object '
+                            'with `getCoords` method')
+
+    if not isinstance(interactions, list):
+        raise TypeError('interactions must be a list of interactions.')
+
+    view = showProtein(atoms,**kwargs)
+    view.addStyle({'stick':{'radius':0.1}})
+
+    if len(interactions[0]) >= 10: 
+        dic_color = {'HBs':'blue','PiStack':'green','SBs':'yellow','PiCat':'orange',
+                     'HPh':'silver','watBridge':'cyan'}
+        
+        for i in interactions:
+            color = dic_color[i[0]]
+
+            if i[0] == 'waterbridge':
+                hoh_id = atoms.select('x `'+str(i[11][0])+'` and y `'+str(i[11][1])+'` and z `'+str(i[11][2])+'`').getResnums()[0]
+
+                view.addCylinder({'start':{'x':i[9][0],'y':i[9][1],'z':i[9][2]},
+                              'end':{'x':i[11][0],'y':i[11][1],'z':i[11][2]},
+                              'color':color, 'dashed':True})
+                view.addCylinder({'start':{'x':i[10][0],'y':i[10][1],'z':i[10][2]},
+                              'end':{'x':i[11][0],'y':i[11][1],'z':i[11][2]},
+                              'color':color, 'dashed': True})                
+            else:
+                view.addCylinder({'start':{'x':i[9][0],'y':i[9][1],'z':i[9][2]},
+                              'end':{'x':i[10][0],'y':i[10][1],'z':i[10][2]},
+                              'color':color, 'dashed': True})
+    return view
 
 
 def showLigandInteraction_VMD(atoms, interactions, **kwargs):
@@ -2407,23 +3206,23 @@ def calcSminaBindingAffinity(atoms, trajectory=None, **kwargs):
     :arg protein_selection: selection string for the protein and other compoment
                             of the system that should be included,
                             e.g. "protein and chain A",
-                            by default "protein" 
+                            Default is "protein" 
     :type protein_selection: str
     
     :arg ligand_selection: selection string for ligand,
                            e.g. "resname ADP",
-                           by default "all not protein"
+                           Default is "all not protein"
     :type ligand_selection: str
     
     :arg ligand_selection: scoring function (vina or vinardo)
-                           by default is "vina"
+                           Default is "vina"
     
     :type ligand_selection: str
     
     :arg atom_terms: write per-atom interaction term values.
                      It will provide more information as dictionary for each frame/model,
                      and details for atom terms will be saved in terms_*frame_number*.txt,    
-                     by default is False
+                     Default is False
 
     :type atom_terms: bool
      
@@ -2469,8 +3268,9 @@ def calcSminaBindingAffinity(atoms, trajectory=None, **kwargs):
         if isinstance(trajectory, Atomic):
             trajectory = Ensemble(trajectory)
     
-        nfi = trajectory._nfi
-        trajectory.reset()
+        if isinstance(trajectory, Trajectory):
+            nfi = trajectory._nfi
+            trajectory.reset()
         numFrames = trajectory._n_csets
 
         if stop_frame == -1:
@@ -2506,7 +3306,8 @@ def calcSminaBindingAffinity(atoms, trajectory=None, **kwargs):
                 bindingAffinity.append(data['Affinity'])
                 data_final.append(data)
         
-        trajectory._nfi = nfi
+        if isinstance(trajectory, Trajectory):
+            trajectory._nfi = nfi
                 
     else:
         if atoms.numCoordsets() == 1:
@@ -2677,6 +3478,767 @@ def showSminaTermValues(data):
     return show
 
 
+def createFoldseekAlignment(prot_seq, prot_foldseek, **kwargs):
+    """Aligns sequences from prot_seq with homologous sequences identified in prot_foldseek, 
+    generating a multiple sequence alignment.
+    
+    :arg prot_seq: The natural sequence extracted from the PDB (seq file)
+    :type prot_seq: str
+    
+    :arg prot_foldseek: The results from foldseek (foldseek file)
+    :type prot_foldseek: str
+
+    :arg msa_output_name: The natural sequence extracted from the PDB (msa file)
+    :type msa_output_name: str
+    """
+
+    msa_output_name = kwargs.pop('msa_output_name', 'prot_struc.msa')
+
+    def find_match_index(tar_nogap, nat_seq):
+        tar_nogap_str = ''.join(tar_nogap)
+        nat_seq_str = ''.join(nat_seq)
+        index = nat_seq_str.find(tar_nogap_str)
+        return index
+
+    # Read input files
+    with open(prot_seq, 'r') as f:
+        file1 = f.readlines()
+
+    with open(prot_foldseek, 'r') as f:
+        file2 = f.readlines()
+
+    # Open output file
+    with open(msa_output_name, 'w') as fp:
+        nat_seq = list(file1[0].strip())
+        
+        # Write the natural sequence to the output file
+        fp.write(''.join(nat_seq) + "\n")
+        
+        # Process each foldseek entry
+        for line in file2:
+            entries = line.split()
+            
+            if float(entries[2]) >= 0.5:
+                tar_seq = list(entries[11].strip())
+                mat_seq = list(entries[12].strip())
+                
+                tar_nogap = []
+                processed_mat = []
+                
+                for j in range(len(tar_seq)):
+                    if tar_seq[j] != '-':
+                        tar_nogap.append(tar_seq[j])
+                        processed_mat.append(mat_seq[j])
+                
+                match_index = find_match_index(tar_nogap, nat_seq)
+                end_index = match_index + len(tar_nogap)
+                m = 0
+                
+                for l in range(len(nat_seq)):
+                    if l < match_index:
+                        fp.write("-")
+                    elif l >= match_index and l < end_index:
+                        fp.write(processed_mat[m])
+                        m += 1
+                    else:
+                        fp.write("-")
+                fp.write("\n")
+    
+    LOGGER.info("MSA file is now created, and saved as {}.".format(msa_output_name))
+
+
+def extractMultiModelPDB(multimodelPDB, **kwargs):
+    """Extracts individual PDB models from multimodel PDB and places them into the pointed directory.
+    If used for calculating calcSignatureInteractions align the models.
+
+    :arg multimodelPDB: The file containing models in multi-model PDB format 
+    :type multimodelPDB: str
+    
+    :arg folder_name: The name of the folder to which PDBs will be extracted
+    :type folder_name: str
+    """
+    
+    import os
+    
+    folder_name = kwargs.pop('folder_name', 'struc_homologs')
+    
+    with open(multimodelPDB, 'r') as f:
+        file = f.readlines()
+    os.makedirs(folder_name, exist_ok=True)
+
+    fp = None
+    for line in file:
+        line = line.strip()
+        sig1 = line[:5]
+        sig2 = line[:6]
+        sig3 = line[:4]
+
+        if sig1 == 'MODEL':
+            model_number = line.split()[1]
+            filename = 'model{}.pdb'.format(model_number)
+            fp = open(filename, 'w')
+            continue
+
+        if sig2 == 'ENDMDL':
+            if fp:
+                fp.close()
+            os.rename(filename, './{}/{}'.format(folder_name,filename))
+            continue
+
+        if sig3 == 'ATOM' and fp:
+            fp.write("{}\n".format(line))
+            
+    LOGGER.info("Individual models are saved in {}.".format(folder_name))
+
+
+def runFoldseek(pdb_file, chain, **kwargs):
+    """This script processes a PDB file to extract a specified chain's sequence, searches for 
+    homologous structures using foldseek, and prepares alignment outputs for further analysis.
+    
+    Before using the function, install Foldseek:
+    >>> conda install bioconda::foldseek
+    More information can be found:
+    https://github.com/steineggerlab/foldseek?tab=readme-ov-file#databasesand
+
+    This function will not work under Windows.
+    Example usage: runFoldseek('5kqm.pdb', 'A', database_folder='~/Downloads/foldseek/pdb')
+    where previous a folder called 'foldseek' were created and PDB database was uploaded using:
+    >>> foldseek databases PDB pdb tmp   (Linux console) 
+    
+    :arg pdb_file: A PDB file path
+    :type pdb_file: str
+
+    :arg chain: Chain identifier
+    :type chain: str
+
+    :arg coverage_threshold: Coverage threshold 
+            Default is 0.3
+    :type coverage_threshold: float
+
+    :arg tm_threshold: TM-score threshold
+            Default is 0.5
+    :type tm_threshold: float
+    
+    :arg database_folder: Folder with the database
+            Default is '~/Downloads/foldseek/pdb'
+            To download the database use: 'foldseek databases PDB pdb tmp' in the console 
+    :type database_folder: str
+
+    :arg fixer: The method for fixing lack of hydrogen bonds
+            Default is 'pdbfixer'
+    :type fixer: 'pdbfixer' or 'openbabel'
+    
+    :arg subset: subsets of atoms: 'ca', 'bb', 'heavy', 'noh', 'all'  (see matchChains())
+            Default is 'ca'
+    :type subset: str
+
+    :arg seqid: Minimum value of the sequence identity (see matchChains())
+            Default is 5
+    :type seqid: float
+    
+    :arg overlap: percent overlap (see matchChains())
+            Default is 50
+    :type overlap: float
+
+    :arg folder_name: Folder where the results will be collected
+            Default is 'struc_homologs'
+    :type folder_name: str """
+    
+    import os
+    import subprocess
+    import re
+    import sys
+
+    database_folder = kwargs.pop('database_folder', '~/Downloads/foldseek/pdb')
+    coverage_threshold = kwargs.pop('coverage_threshold', 0.3)
+    tm_threshold = kwargs.pop('tm_threshold', 0.5)    
+    folder_name = kwargs.pop('folder_name', 'struc_homologs')
+    subset = kwargs.pop('subset', 'ca')
+    seqid = kwargs.pop('seqid', 5)
+    overlap = kwargs.pop('overlap', 50)
+    
+    if not isinstance(pdb_file, str):
+        raise TypeError('Please provide the name of the PDB file.')
+    
+    full_path = os.path.expanduser(database_folder)
+    if not os.path.exists(full_path.strip('pdb')):
+        raise ValueError('The required database is not found in {0}. Please download it first.'.format(database_folder.strip('pdb')))
+    
+    # Define the amino acid conversion function
+    def aa_onelet(three_letter_code):
+        codes = {
+            'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
+            'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+            'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
+            'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
+            'MSE': 'M'
+        }
+        return codes.get(three_letter_code)
+
+    # Function to extract the sequence from the PDB file
+    def extract_sequence_from_pdb(pdb_file, chain, output_file):
+        sequence = []
+        prev_resid = -9999
+
+        with open(pdb_file, 'r') as pdb:
+            for line in pdb:
+                if line.startswith("ATOM"):
+                    ch = line[21]
+                    resid = int(line[22:26].strip())
+                    aa = line[17:20].strip()
+
+                    if ch == chain and resid != prev_resid:
+                        one_aa = aa_onelet(aa)
+                        if one_aa:
+                            sequence.append(one_aa)
+                            prev_resid = resid
+
+        with open(output_file, 'w') as seq_file:
+            seq_file.write(''.join(sequence))
+
+    # Inputs
+    fpath = pdb_file.strip()
+    chain = chain.strip()
+    cov_threshold = float(coverage_threshold)
+    tm_threshold = float(tm_threshold)
+    
+    # Filter PDB file
+    awk_command = "awk '{{if (substr($0, 22, 1) == \"{0}\") print}}'".format(chain)
+    subprocess.run("cat {0} | grep '^ATOM' | {1} > inp.pdb".format(fpath, awk_command), shell=True)
+
+    # Run foldseek and other commands
+    subprocess.run([
+        'foldseek', 'easy-search', 'inp.pdb', database_folder, 'prot.foldseek',
+        'tmp2', '--exhaustive-search', '1', '--format-output',
+        "query,target,qstart,qend,tstart,tend,qcov,tcov,qtmscore,ttmscore,rmsd,qaln,taln",
+        '-c', str(cov_threshold), '--cov-mode', '0'
+    ])
+    
+    # Extract sequence and write to prot.seq
+    extract_sequence_from_pdb('inp.pdb', chain, 'prot.seq')
+    createFoldseekAlignment('prot.seq', 'prot.foldseek', msa_output_name='prot_struc.msa')    
+    
+    # Read input files
+    with open('inp.pdb', 'r') as f:
+        file1 = f.readlines()
+
+    with open('prot.foldseek', 'r') as f:
+        file2 = f.readlines()
+
+    with open('prot_struc.msa', 'r') as f:
+        file3 = f.readlines()
+
+    # Open output files
+    fp1 = open("aligned_structures.pdb", 'w')
+    fp2 = open("shortlisted_resind.msa", 'w')
+    fp6 = open("seq_match_reconfirm.txt", 'w')
+    fp7 = open("aligned_structures_extended.pdb", 'w')
+    fp9 = open("shortlisted.foldseek", 'w')
+    fp10 = open("shortlisted.msa", 'w')
+
+    # Initialize variables
+    mod_count = 1
+    fp1.write("MODEL\t{0}\n".format(mod_count))
+    fp7.write("MODEL\t{0}\n".format(mod_count))
+
+    seq1 = list(file3[0].strip())
+    ind1 = 0
+    prev_id = -9999
+
+    # Process input PDB file
+    for line in file1:
+        line = line.strip()
+        id_ = line[0:4]
+        ch = line[21]
+        resid = int(line[22:26].strip())
+        aa = line[17:20]
+
+        if id_ == 'ATOM' and ch == chain and resid != prev_id:
+            prev_id = resid
+            one_aa = aa_onelet(aa)
+            if one_aa == seq1[ind1]:
+                fp1.write("{0}\n".format(line))
+                fp7.write("{0}\n".format(line))
+                fp2.write("{0} ".format(resid))
+                ind1 += 1
+            else:
+                print("Mismatch in sequence and structure of Query protein at Index {0}".format(ind1))
+                break
+        elif id_ == 'ATOM' and ch == chain and resid == prev_id:
+            fp1.write("{0}\n".format(line))
+            fp7.write("{0}\n".format(line))
+
+    fp1.write("TER\nENDMDL\n\n")
+    fp7.write("TER\nENDMDL\n\n")
+    fp2.write("\n")
+    fp10.write("{0}\n".format(file3[0].strip()))
+
+    # Processing foldseek results
+    os.makedirs("temp", exist_ok=True)
+
+    for i, entry in enumerate(file2):
+        entries = re.split(r'\s+', entry.strip())
+
+        if float(entries[8]) < tm_threshold:
+            continue
+
+        tstart = int(entries[4])
+        tend = int(entries[5])
+        pdb = entries[1][:4]
+        chain = entries[1][-1]
+        fname = "{0}.pdb".format(pdb)
+
+        # Download and process the target PDB file
+        subprocess.run(['wget', '-P', 'temp', "https://files.rcsb.org/download/{0}".format(fname)])
+
+        awk_command = "awk '{{if (substr($0, 22, 1) == \"{0}\") print}}'".format(chain)
+        subprocess.run("cat ./temp/{0} | grep -E '^(ATOM|HETATM)' | {1} > target.pdb".format(fname, awk_command), shell=True)
+
+        # Check if target.pdb has fewer than 5 lines
+        if sum(1 for _ in open("target.pdb")) < 5:
+            LOGGER.info("target.pdb has fewer than 5 lines. Skipping further processing.")
+            subprocess.run(['rm', 'target.pdb'])
+            continue
+
+        with open('target.pdb', 'r') as target_file:
+            file4 = target_file.readlines()
+
+        qseq = list(entries[11])
+        tseq = list(entries[12])
+
+        start_line = 0
+        prevind = -9999
+        tarind = 0
+
+        for j, line in enumerate(file4):
+            resid = int(line[22:26].strip())
+            if resid != prevind:
+                prevind = resid
+                tarind += 1
+            if tarind == tstart:
+                start_line = j
+                break
+
+        prevind = -9999
+        ind2 = 0
+        j = start_line
+        flag2 = False
+
+        with open("temp_coord.txt", 'w') as fp4, \
+             open("temp_resind.txt", 'w') as fp3, \
+             open("temp_seq.txt", 'w') as fp5:
+
+            for k in range(len(qseq)):
+                if tseq[k] != '-' and qseq[k] != '-':
+                    line = file4[j].strip()
+                    resid = int(line[22:26].strip())
+                    aa = line[17:20]
+                    one_aa = aa_onelet(aa)
+
+                    if one_aa == tseq[k]:
+                        fp3.write("{0} ".format(resid))
+                        fp5.write("{0}".format(one_aa))
+                        prevind = resid
+                    else:
+                        print("Mismatch in sequence and structure of Target protein {0}{1} at line {2} Index {3}-{4} ne {5}".format(
+                            pdb, chain, j, k, one_aa, tseq[k]))
+                        flag2 = True
+                        break
+
+                    while resid == prevind:
+                        fp4.write("{0}\n".format(line))
+                        j += 1
+                        if j >= len(file4):
+                            break
+                        line = file4[j].strip()
+                        resid = int(line[22:26].strip())
+                elif tseq[k] != '-' and qseq[k] == '-':
+                    line = file4[j].strip()
+                    resid = int(line[22:26].strip())
+                    aa = line[17:20]
+                    one_aa = aa_onelet(aa)
+
+                    if one_aa == tseq[k]:
+                        prevind = resid
+                    else:
+                        print("Mismatch in sequence and structure of Target protein {0}{1} at Line {2} Index {3}-{4} ne {5}".format(
+                            pdb, chain, j, k, one_aa, tseq[k]))
+                        flag2 = True
+                        break
+
+                    while resid == prevind:
+                        j += 1
+                        if j >= len(file4):
+                            break
+                        line = file4[j].strip()
+                        resid = int(line[22:26].strip())
+
+                elif tseq[k] == '-' and qseq[k] != '-':
+                    fp3.write("- ")
+                    fp5.write("-")
+
+            if flag2:
+                continue
+
+        with open("temp_coord.txt", 'r') as f:
+            tmpcord = f.readlines()
+
+        with open("temp_resind.txt", 'r') as f:
+            tmpresind = f.readlines()
+
+        with open("temp_seq.txt", 'r') as f:
+            tmpseq = f.readlines()
+
+        ind3 = i + 1
+        seq1 = list(file3[ind3].strip())
+        seq2 = tmpresind[0].strip().split()
+
+        fp9.write("{0}".format(file2[i]))
+        fp10.write("{0}\n".format(file3[ind3].strip()))
+
+        for m in range(len(seq1)):
+            if seq1[m] == '-':
+                fp2.write("{0} ".format(seq1[m]))
+            else:
+                break
+
+        for n in range(len(seq2)):
+            fp2.write("{0} ".format(seq2[n]))
+            fp6.write("{0}".format(seq1[m]))
+            m += 1
+
+        for o in range(m, len(seq1)):
+            fp2.write("{0} ".format(seq1[m]))
+
+        fp2.write("\n")
+        fp6.write("\n{0}\n\n\n".format(tmpseq[0]))
+
+        mod_count += 1
+        fp1.write("MODEL\t{0}\n".format(mod_count))
+        fp7.write("MODEL\t{0}\n".format(mod_count))
+
+        for line in file4:
+            if line.strip():
+                fp7.write("{0}\n".format(line.strip()))
+
+        for line in tmpcord:
+            fp1.write("{0}".format(line))
+
+        fp1.write("TER\nENDMDL\n\n")
+        fp7.write("TER\nENDMDL\n\n")
+
+    # Cleanup
+    fp1.close()
+    fp2.close()
+    fp6.close()
+    fp7.close()
+    fp9.close()
+    fp10.close()
+
+    extractMultiModelPDB('aligned_structures.pdb', folder_name=folder_name)
+    subprocess.run("rm -f inp.pdb prot.seq target.pdb temp_coord.txt temp_resind.txt temp_seq.txt", shell=True)
+    subprocess.run("rm -rf tmp2 temp", shell=True)
+
+    # New part
+    pwd = os.path.abspath(folder_name)
+    list_pdbs = [pwd+'/'+ff for ff in os.listdir(pwd) if ff.endswith('.pdb')]
+    list_pdbs.sort(key=lambda x: int(''.join(filter(str.isdigit, x)))) # all structures will be aligned on model1.pdb as in the oryginal code
+    
+    LOGGER.info('Adding hydrogens to the structures..')
+    new_pdbids = fixStructuresMissingAtoms(list_pdbs, method='pdbfixer', model_residues=True, overwrite=True)
+    
+    structures = parsePDB(new_pdbids)
+    target = structures[0]
+    rmsds = []
+    for mobile in structures[1:]:
+        try:
+            LOGGER.info('Aligning the structures..')
+            i = mobile.getTitle()
+            LOGGER.info(i)
+            matches = matchChains(mobile.protein, target.protein, subset=subset, seqid=seqid, overlap=overlap)
+            m = matches[0]
+            m0_alg, T = superpose(m[0], m[1], weights=m[0].getFlags("mapped"))
+            rmsds.append(calcRMSD(m[0], m[1], weights=m[0].getFlags("mapped")))
+            source_file = pwd+'/'+'align__'+i+'.pdb'
+            writePDB(source_file, mobile)
+        except:
+            LOGGER.warn('There is a problem with {}. Change seqid or overlap parameter to include the structure.'.format(i))
+    
+    
+def runDali(pdb, chain, **kwargs):
+    """This function calls searchDali() and downloads all the PDB files, separate by chains, add hydrogens and missing side chains,
+    and finally align them and put into the newly created folder.
+       
+    :arg pdb: A PDB code
+    :type pdb: str
+
+    :arg chain: chain identifier
+    :type chain: str
+
+    :arg cutoff_len: Length of aligned residues < cutoff_len
+            (must be an integer or a float between 0 and 1)
+            See searchDali for more details 
+            Default is 0.5
+    :type cutoff_len: float
+
+    :arg cutoff_rmsd: RMSD cutoff (see searchDali)
+            Default is 1.0
+    :type cutoff_rmsd: float
+    
+    :arg cutoff_Z: Z score cutoff (see searchDali)
+            Default is None
+    :type cutoff_Z: float
+
+    :arg cutoff_identity: RMSD cutoff (see searchDali)
+            Default is None
+    :type cutoff_identity: float
+
+    :arg stringency: stringency for Dali cutoffs (see searchDali)
+            Default is False
+    :type stringency: bool
+
+    :arg subset_Dali: fullPDB, PDB25, PDB50, PDB90
+            Default is 'fullPDB'
+    :type subset_Dali: str    
+    
+    :arg fixer: The method for fixing lack of hydrogen bonds
+            Default is 'pdbfixer'
+    :type fixer: 'pdbfixer' or 'openbabel'
+    
+    :arg subset: subsets of atoms: 'ca', 'bb', 'heavy', 'noh', 'all'  (see matchChains())
+            Default is 'ca'
+    :type subset: str
+
+    :arg seqid: Minimum value of the sequence identity (see matchChains())
+            Default is 5
+    :type seqid: float
+    
+    :arg overlap: percent overlap (see matchChains())
+            Default is 50
+    :type overlap: float
+
+    :arg folder_name: Folder where the results will be collected
+            Default is 'struc_homologs'
+    :type folder_name: str """
+
+    import os
+    import shutil
+    from prody.database import dali 
+    
+    cutoff_len = kwargs.pop('cutoff_len', 0.5)
+    cutoff_rmsd = kwargs.pop('cutoff_rmsd', 1.0)
+    cutoff_Z = kwargs.pop('cutoff_Z', None)
+    cutoff_identity = kwargs.pop('cutoff_identity', None)
+    stringency = kwargs.pop('stringency', False)
+
+    fixer = kwargs.pop('fixer', 'pdbfixer')
+    subset_Dali = kwargs.pop('subset_Dali', 'fullPDB')
+    subset = kwargs.pop('subset', 'ca')
+    seqid = kwargs.pop('seqid', 5)
+    overlap = kwargs.pop('overlap', 50)
+    folder_name = kwargs.pop('folder_name', 'struc_homologs')
+    
+    dali_rec = dali.searchDali(pdb, chain, subset=subset_Dali)
+
+    while not dali_rec.isSuccess:
+        dali_rec.fetch()
+    
+    pdb_ids = dali_rec.filter(cutoff_len=cutoff_len, cutoff_rmsd=cutoff_rmsd,
+                              cutoff_Z=cutoff_Z, cutoff_identity=cutoff_identity,
+                              stringency=stringency)
+    pdb_hits = [ (i[:4], i[4:]) for i in pdb_ids ]
+    
+    list_pdbs = []
+    LOGGER.info('Separating chains and saving into PDB file')
+    for i in pdb_hits:
+        LOGGER.info('PDB code {} and chain {}'.format(i[0], i[1]))
+        p = parsePDB(i[0]).select('chain '+i[1]+' and protein')
+        writePDB(i[0]+i[1]+'.pdb', p)
+        list_pdbs.append(i[0]+i[1]+'.pdb')
+    
+    LOGGER.info('Adding hydrogens to the structures..')
+    new_pdbids = fixStructuresMissingAtoms(list_pdbs, method='pdbfixer', model_residues=True, overwrite=True)
+
+    os.makedirs(folder_name)
+    structures = parsePDB(new_pdbids)
+    target = structures[0]
+    rmsds = []
+    for mobile in structures[1:]:
+        try:
+            LOGGER.info('Aligning the structures..')
+            i = mobile.getTitle()
+            LOGGER.info(i)
+            matches = matchChains(mobile.protein, target.protein, subset=subset, seqid=seqid, overlap=overlap)
+            m = matches[0]
+            m0_alg, T = superpose(m[0], m[1], weights=m[0].getFlags("mapped"))
+            rmsds.append(calcRMSD(m[0], m[1], weights=m[0].getFlags("mapped")))
+            source_file = 'align__'+i+'.pdb'
+            writePDB(source_file, mobile)
+            shutil.move(source_file, os.path.join(folder_name, os.path.basename(source_file)))
+        except:
+            LOGGER.warn('There is a problem with {}. Change seqid or overlap parameter to include the structure.'.format(i))
+
+
+def runBLAST(pdb, chain, **kwargs):
+    """This function calls blastPDB to find homologs and downloads all of them in PDB format to the local directory,
+    separate chains that were identified by BLAST, add hydrogens and missing side chains,
+    and finally align them and put into the newly created folder.
+       
+    :arg pdb: A PDB code
+    :type pdb: str
+
+    :arg chain: chain identifier
+    :type chain: str
+
+    :arg fixer: The method for fixing lack of hydrogen bonds
+            Default is 'pdbfixer'
+    :type fixer: 'pdbfixer' or 'openbabel'
+    
+    :arg subset: subsets of atoms: 'ca', 'bb', 'heavy', 'noh', 'all'  (see matchChains())
+            Default is 'bb'
+    :type subset: str
+
+    :arg seqid: Minimum value of the sequence identity (see matchChains())
+            Default is 90
+    :type seqid: float
+    
+    :arg overlap: percent overlap (see matchChains())
+            Default is 50
+    :type overlap: float
+
+    :arg folder_name: Folder where the results will be collected
+            Default is 'struc_homologs'
+    :type folder_name: str """
+    
+    import os
+    import shutil
+    from prody.proteins.blastpdb import blastPDB
+    
+    fixer = kwargs.pop('fixer', 'pdbfixer')
+    seqid = kwargs.pop('seqid', 90)
+    overlap = kwargs.pop('overlap', 50)
+    subset = kwargs.pop('subset', 'bb')
+    folder_name = kwargs.pop('folder_name', 'struc_homologs')
+
+    ref_prot = parsePDB(pdb)
+    ref_hv = ref_prot.getHierView()[chain]
+    sequence = ref_hv.getSequence()
+
+    blast_record = blastPDB(sequence)
+    while not blast_record.isSuccess:
+        blast_record.fetch()
+
+    pdb_hits = []
+    for key, item in blast_record.getHits(seqid).items():
+        pdb_hits.append((key, item['chain_id']))
+
+    list_pdbs = []
+    LOGGER.info('Separating chains and saving into PDB file')
+    for i in pdb_hits:
+        LOGGER.info('PDB code {} and chain {}'.format(i[0], i[1]))
+        p = parsePDB(i[0]).select('chain '+i[1]+' and protein')
+        writePDB(i[0]+i[1]+'.pdb', p)
+        list_pdbs.append(i[0]+i[1]+'.pdb')
+    
+    LOGGER.info('Adding hydrogens to the structures..')
+    new_pdbids = fixStructuresMissingAtoms(list_pdbs, method='pdbfixer', model_residues=True, overwrite=True)
+
+    os.makedirs(folder_name)
+    structures = parsePDB(new_pdbids)
+    target = structures[0]
+    rmsds = []
+    for mobile in structures[1:]:
+        try:
+            LOGGER.info('Aligning the structures..')
+            i = mobile.getTitle()
+            LOGGER.info(i)
+            matches = matchChains(mobile.protein, target.protein, subset=subset, seqid=seqid, overlap=overlap)
+            m = matches[0]
+            m0_alg, T = superpose(m[0], m[1], weights=m[0].getFlags("mapped"))
+            rmsds.append(calcRMSD(m[0], m[1], weights=m[0].getFlags("mapped")))
+            source_file = 'align__'+i+'.pdb'
+            writePDB(source_file, mobile)
+            shutil.move(source_file, os.path.join(folder_name, os.path.basename(source_file)))
+        except:
+            LOGGER.warn('There is a problem with {}. Change seqid or overlap parameter to include the structure.'.format(i))
+
+
+def calcSignatureInteractions(PDB_folder, **kwargs):
+    """Analyzes protein structures to identify various interactions using InSty. 
+    Processes data from the MSA file and folder with selected models.
+    
+    Example usage: 
+    >>> calcSignatureInteractions('./struc_homologs')
+    >>> calcSignatureInteractions('./struc_homologs', mapping_file='shortlisted_resind.msa')
+
+    :arg PDB_folder: Directory containing PDB model files
+    :type PDB_folder: str
+
+    :arg use_prefix: Whether to use perfix to select particular file names in the PDB_folder
+            Default is True
+    :type use_prefix: bool
+
+    :arg mapping_file: Aligned residue indices, MSA file type
+            required in Foldseek analyisis
+    :type mapping_file: str """
+    
+    import os
+    mapping_file = kwargs.get('mapping_file')
+    use_prefix = kwargs.pop('use_prefix', True)
+    
+    if use_prefix == True:
+        align_files = [os.path.join(PDB_folder, file) for file in os.listdir(PDB_folder) if file.startswith("align_")]
+
+    else:
+        align_files = [os.path.join(PDB_folder, file) for file in os.listdir(PDB_folder)]
+
+    functions_dict = {
+        "HBs": calcHydrogenBonds,
+        "SBs": calcSaltBridges,
+        "RIB": calcRepulsiveIonicBonding,
+        "PiStack": calcPiStacking,
+        "PiCat": calcPiCation,
+        "HPh": calcHydrophobic,
+        "DiBs": calcDisulfideBonds
+    }
+
+    if not mapping_file:
+        for bond_type, func in functions_dict.items():
+            for file in align_files:
+                try:
+                    LOGGER.info(file)
+                    atoms = parsePDB(file)
+                    interactions = func(atoms.select('protein'))
+                    saveInteractionsAsDummyAtoms(atoms, interactions, filename=file.rstrip(file.split('/')[-1])+'INT_'+bond_type+'_'+file.split('/')[-1])
+                except: pass
+        
+    if mapping_file:
+        # for MSA file (Foldseek)
+        n_per_plot = kwargs.pop('n_per_plot', None)
+        min_height = kwargs.pop('min_height', 8)
+        
+        # Process each bond type
+        for bond_type, func in functions_dict.items():
+            # Check if the consensus file already exists
+            consensus_file = '{}_consensus.txt'.format(bond_type)
+            if os.path.exists(consensus_file):
+                log_message("Consensus file for {} already exists, skipping.".format(bond_type), "INFO")
+                continue
+
+            log_message("Processing {}".format(bond_type))
+            result = process_data(mapping_file, PDB_folder, func, bond_type, files_for_analysis=align_files)
+
+            # Check if the result is None (no valid bonds found)
+            if result is None:
+                log_message("No valid {} entries found, skipping further processing.".format(bond_type), "WARNING")
+                continue
+
+            result, fixed_files = result
+
+            # Proceed with plotting
+            plot_barh(result, bond_type, n_per_plot=n_per_plot, min_height=min_height)
+            
+
 
 class Interactions(object):
 
@@ -2687,6 +4249,8 @@ class Interactions(object):
         self._atoms = None
         self._interactions = None
         self._interactions_matrix = None
+        self._interactions_matrix_en = None
+        self._energy_type = None
         self._hbs = None
         self._sbs = None
         self._rib = None
@@ -2726,7 +4290,7 @@ class Interactions(object):
                 raise TypeError('coords must be an object '
                                 'with `getCoords` method')
 
-        LOGGER.info('Calculating interations.') 
+        LOGGER.info('Calculating interactions.')
         HBs_calculations = calcHydrogenBonds(atoms.protein, **kwargs)               #1 in scoring
         SBs_calculations = calcSaltBridges(atoms.protein, **kwargs)                 #2
         SameChargeResidues = calcRepulsiveIonicBonding(atoms.protein, **kwargs)     #3
@@ -2766,14 +4330,33 @@ class Interactions(object):
         :arg selection2: selection string
         :type selection2: str 
         
+        :arg replace: Used with selection criteria to set the new one
+                      If set to **True** the selection will be replaced by the new one.
+                      Default is **False**
+        :type replace: bool
+
         Selection:
         If we want to select interactions for the particular residue or group of residues: 
             selection='chain A and resid 1 to 50'
         If we want to study chain-chain interactions:
             selection='chain A', selection2='chain B'  """
-
+        
+        replace = kwargs.pop('replace', False)
+                
         if len(kwargs) != 0:
             results = [filterInteractions(j, self._atoms, **kwargs) for j in self._interactions]
+
+            if replace == True:
+                LOGGER.info('New interactions are set')
+                self._interactions = results           
+                self._hbs = results[0]
+                self._sbs = results[1]
+                self._rib = results[2]
+                self._piStack = results[3] 
+                self._piCat = results[4]
+                self._hps = results[5]
+                self._dibs = results[6]
+
         else: 
             results = self._interactions
         
@@ -3040,7 +4623,7 @@ class Interactions(object):
         atoms = self._atoms   
         interactions = self._interactions
         
-        LOGGER.info('Calculating interactions')
+        LOGGER.info('Calculating interaction matrix')
         InteractionsMap = np.zeros([atoms.select('name CA').numAtoms(),atoms.select('name CA').numAtoms()])
         resIDs = list(atoms.select('name CA').getResnums())
         resChIDs = list(atoms.select('name CA').getChids())
@@ -3086,6 +4669,57 @@ class Interactions(object):
         return InteractionsMap
 
 
+    def buildInteractionMatrixEnergy(self, **kwargs):
+        """Build matrix with interaction energy comming from energy of pairs of specific residues.
+
+        :arg energy_list_type: name of the list with energies 
+                            Default is 'IB_solv'
+                            acceptable values are 'IB_nosolv', 'IB_solv', 'CS'
+        :type energy_list_type: str
+
+        'IB_solv' and 'IB_nosolv' are derived from empirical potentials from
+        O Keskin, I Bahar and colleagues from [OK98]_ and have RT units.
+
+        'CS' is from MD simulations of amino acid pairs from Carlos Simmerling
+        and Gary Wu in the [MR25]_ and have units of kcal/mol. 
+        
+        .. [MR25] Mikulska-Ruminska K, Krieger JM, Cao X, Banerjee A, Wu G, 
+        Bogetti AT, Zhang F, Simmerling C, Coutsias EA, Bahar I
+        InSty: a new module in ProDy for evaluating the interactions 
+        and stability of proteins
+        *Bioinformatics* **2025** 169009
+        """
+        
+        import numpy as np
+        import matplotlib
+        import matplotlib.pyplot as plt
+        from prody.dynamics.plotting import pplot
+        
+        atoms = self._atoms   
+        interactions = self._interactions
+        energy_list_type = kwargs.pop('energy_list_type', 'IB_solv')
+
+        LOGGER.info('Calculating interaction energies matrix with type {0}'.format(energy_list_type))
+        InteractionsMap = np.zeros([atoms.select('name CA').numAtoms(),atoms.select('name CA').numAtoms()])
+        resIDs = list(atoms.select('name CA').getResnums())
+        resChIDs = list(atoms.select('name CA').getChids())
+        resIDs_with_resChIDs = list(zip(resIDs, resChIDs))
+            
+        for i in interactions:
+            if i != []:
+                for ii in i: 
+                    m1 = resIDs_with_resChIDs.index((int(ii[0][3:]),ii[2]))
+                    m2 = resIDs_with_resChIDs.index((int(ii[3][3:]),ii[5]))
+                    scoring = get_energy([ii[0][:3], ii[3][:3]], energy_list_type)
+                    if InteractionsMap[m1][m2] == 0:
+                        InteractionsMap[m1][m2] = InteractionsMap[m2][m1] = float(scoring)
+
+        self._interactions_matrix_en = InteractionsMap
+        self._energy_type = energy_list_type
+        
+        return InteractionsMap
+
+
     def showInteractors(self, **kwargs):
         """Display protein residues and their number of potential interactions
         with other residues from protein structure. """
@@ -3126,23 +4760,40 @@ class Interactions(object):
         
         :arg filename: name of the PDB file which will be saved for visualization,
                      it will contain the results in occupancy column.
-        :type filename: str  """
+        :type filename: str  
+        
+        :arg energy: sum of the energy between residues
+                    default is False
+        :type energy: bool 
+        """
+        
+        energy = kwargs.pop('energy', False)
         
         if not hasattr(self, '_interactions_matrix') or self._interactions_matrix is None:
             raise ValueError('Please calculate interactions matrix first.')
 
-        import numpy as np
-        interaction_matrix = self._interactions_matrix
-        atoms = self._atoms     
-        freq_contacts_residues = np.sum(interaction_matrix, axis=0)
+        if not isinstance(energy, bool):
+            raise TypeError('energy should be True or False')
         
+        import numpy as np
         from collections import Counter
-        lista_ext = []
+        
+        atoms = self._atoms 
+        interaction_matrix = self._interactions_matrix
+        interaction_matrix_en = self._interactions_matrix_en
+        
         atoms = atoms.select("protein and noh")
+        lista_ext = []
         aa_counter = Counter(atoms.getResindices())
         calphas = atoms.select('name CA')
+        
         for i in range(calphas.numAtoms()):
-            lista_ext.extend(list(aa_counter.values())[i]*[round(freq_contacts_residues[i], 8)])
+            if energy == True:
+                matrix_en_sum = np.sum(interaction_matrix_en, axis=0)
+                lista_ext.extend(list(aa_counter.values())[i]*[round(matrix_en_sum[i], 8)]) 
+            else:
+                freq_contacts_residues = np.sum(interaction_matrix, axis=0)            
+                lista_ext.extend(list(aa_counter.values())[i]*[round(freq_contacts_residues[i], 8)])        
 
         kw = {'occupancy': lista_ext}
         if 'filename' in kwargs:
@@ -3152,7 +4803,43 @@ class Interactions(object):
             writePDB('filename', atoms, **kw)
             LOGGER.info('PDB file saved.')
 
-    def getFrequentInteractors(self, contacts_min=3):
+    
+    def getInteractors(self, residue_name):
+        """ Provide information about interactions for a particular residue
+        
+        :arg residue_name: name of a resiude
+                            example: LEU234A, where A is a chain name
+        :type residue_name: str
+        """
+        
+        atoms = self._atoms   
+        interactions = self._interactions
+        
+        InteractionsMap = np.empty([atoms.select('name CA').numAtoms(),atoms.select('name CA').numAtoms()], dtype=object)
+        resIDs = list(atoms.select('name CA').getResnums())
+        resChIDs = list(atoms.select('name CA').getChids())
+        resIDs_with_resChIDs = list(zip(resIDs, resChIDs))
+        interaction_type = ['hb','sb','rb','ps','pc','hp','dibs']
+        ListOfInteractions = []
+        
+        for nr,i in enumerate(interactions):
+            if i != []:
+                for ii in i: 
+                    m1 = resIDs_with_resChIDs.index((int(ii[0][3:]),ii[2]))
+                    m2 = resIDs_with_resChIDs.index((int(ii[3][3:]),ii[5]))
+                    ListOfInteractions.append(interaction_type[nr]+':'+ii[0]+ii[2]+'-'+ii[3]+ii[5])
+        
+        aa_ListOfInteractions = []
+        for i in ListOfInteractions:
+            inter = i.split(":")[1:][0]
+            if inter.split('-')[0] == residue_name or inter.split('-')[1] == residue_name:
+                LOGGER.info(i)
+                aa_ListOfInteractions.append(i)
+        
+        return aa_ListOfInteractions
+        
+    
+    def getFrequentInteractors(self, contacts_min=2):
         """Provide a list of residues with the most frequent interactions based 
         on the following interactions:
             (1) Hydrogen bonds (hb)
@@ -3164,7 +4851,7 @@ class Interactions(object):
             (7) Disulfide bonds (disb)
         
         :arg contacts_min: Minimal number of contacts which residue may form with other residues, 
-                           by default 3.
+                           Default is 2.
         :type contacts_min: int  """
 
         atoms = self._atoms   
@@ -3181,18 +4868,43 @@ class Interactions(object):
                 for ii in i: 
                     m1 = resIDs_with_resChIDs.index((int(ii[0][3:]),ii[2]))
                     m2 = resIDs_with_resChIDs.index((int(ii[3][3:]),ii[5]))
-                    InteractionsMap[m1][m2] = interaction_type[nr]+':'+ii[0]+ii[2]+'-'+ii[3]+ii[5]
+
+                    if InteractionsMap[m1][m2] is None:
+                        InteractionsMap[m1][m2] = []
             
-        ListOfInteractions = [ list(filter(None, InteractionsMap[:,j])) for j in range(len(interactions[0])) ]
-        ListOfInteractions = list(filter(lambda x : x != [], ListOfInteractions))
-        ListOfInteractions = [k for k in ListOfInteractions if len(k) >= contacts_min ]
-        ListOfInteractions_list = [ (i[0].split('-')[-1], [ j.split('-')[0] for j in i]) for i in ListOfInteractions ]
-        LOGGER.info('The most frequent interactions between:')
-        for res in ListOfInteractions_list:
+                    InteractionsMap[m1][m2].append(interaction_type[nr] + ':' + ii[0] + ii[2] + '-' + ii[3] + ii[5])
+            
+        ListOfInteractions = [list(filter(None, [row[j] for row in InteractionsMap])) for j in range(len(InteractionsMap[0]))]
+        ListOfInteractions = list(filter(lambda x: x != [], ListOfInteractions))
+        ListOfInteractions_flattened = [j for sublist in ListOfInteractions for j in sublist]
+
+        swapped_ListOfInteractions_list = []
+        for interaction_group in ListOfInteractions_flattened:
+            swapped_group = []
+            for interaction in interaction_group:
+                interaction_type, pair = interaction.split(':')
+                swapped_pair = '-'.join(pair.split('-')[::-1])
+                swapped_group.append("{}:{}".format(interaction_type, swapped_pair))
+            swapped_ListOfInteractions_list.append(swapped_group)
+
+        doubleListOfInteractions_list = ListOfInteractions_flattened+swapped_ListOfInteractions_list
+        ListOfInteractions_list = [(i[0].split('-')[-1], [j.split('-')[0] for j in i]) for i in doubleListOfInteractions_list]
+
+        merged_dict = {}
+        for aa, ii in ListOfInteractions_list:
+            if aa in merged_dict:
+                merged_dict[aa].extend(ii)
+            else:
+                merged_dict[aa] = ii
+
+        ListOfInteractions_list = [(key, value) for key, value in merged_dict.items()] 
+        ListOfInteractions_list2 = [k for k in ListOfInteractions_list if len(k[-1]) >= contacts_min]
+            
+        for res in ListOfInteractions_list2:
             LOGGER.info('{0}  <--->  {1}'.format(res[0], '  '.join(res[1])))
 
-        LOGGER.info('Legend: hb-hydrogen bond, sb-salt bridge, rb-repulsive ionic bond, ps-Pi stacking interaction,'
-                             'pc-Cation-Pi interaction, hp-hydrophobic interaction, dibs-disulfide bonds')
+        LOGGER.info('\nLegend: hb-hydrogen bond, sb-salt bridge, rb-repulsive ionic bond, ps-Pi stacking interaction,'
+                             '\npc-Cation-Pi interaction, hp-hydrophobic interaction, dibs-disulfide bonds')
         
         try:
             from toolz.curried import count
@@ -3200,17 +4912,15 @@ class Interactions(object):
             LOGGER.warn('This function requires the module toolz')
             return
         
-        LOGGER.info('The biggest number of interactions: {}'.format(max(map(count, ListOfInteractions))))
-        
-        return ListOfInteractions_list
+        return ListOfInteractions_list2
         
 
-    def showFrequentInteractors(self, cutoff=5, **kwargs):
+    def showFrequentInteractors(self, cutoff=4, **kwargs):
         """Plots regions with the most frequent interactions.
         
         :arg cutoff: minimal score per residue which will be displayed.
-                     If cutoff value is to big, top 30% with the higest values will be returned.
-                     Default is 5.
+                     If cutoff value is too big, top 30% with the higest values will be returned.
+                     Default is 4.
         :type cutoff: int, float
 
         Nonstandard resiudes can be updated in a following way:
@@ -3254,18 +4964,22 @@ class Interactions(object):
                 y.append(all_y[nr_ii])
 
         if SETTINGS['auto_show']:
-            matplotlib.rcParams['font.size'] = '20' 
-            fig = plt.figure(num=None, figsize=(12,6), facecolor='w')
+            matplotlib.rcParams['font.size'] = '12' 
+            fig = plt.figure(num=None, figsize=(16,5), facecolor='w')
         
         y_pos = np.arange(len(y))
         show = plt.bar(y_pos, x, align='center', alpha=0.5, color='blue')
-        plt.xticks(y_pos, y, rotation=45, fontsize=20)
-        plt.ylabel('Number of interactions')
+        plt.xticks(y_pos, y, rotation=45, fontsize=16)
+        plt.ylabel('Number of interactions', fontsize=16)
         plt.tight_layout()
 
         if SETTINGS['auto_show']:
             showFigure()
-        return show        
+            
+        dict_counts = dict(zip(y, x))
+        dict_counts_sorted = dict(sorted(dict_counts.items(), key=lambda item: item[1], reverse=True))
+            
+        return dict_counts_sorted
 
 
     def showCumulativeInteractionTypes(self, **kwargs):
@@ -3291,7 +5005,44 @@ class Interactions(object):
         :type HPh: int, float
 
         :arg DiBs: score per disulfide bond
-        :type DiBs: int, float """
+        :type DiBs: int, float 
+
+        :arg selstr: selection string for focusing the plot
+        :type selection: str
+
+        :arg energy: sum of the energy between residues
+                    default is False
+        :type energy: bool
+
+        :arg energy_list_type: name of the list with energies
+                            default is 'IB_solv'
+                            acceptable values are 'IB_nosolv', 'IB_solv', 'CS'
+        :type energy_list_type: str
+
+        :arg overwrite_energies: whether to overwrite energies
+                            default is False
+        :type overwrite_energies: bool
+
+        :arg percentile: a percentile threshold to remove outliers, i.e. only showing data within *p*-th
+                        to *100-p*-th percentile. Default is None, so no axis limits.
+        :type percentile: float
+
+        :arg vmin: a minimum value threshold to remove outliers, i.e. only showing data greater than vmin
+                This overrides percentile. Default is None, so no axis limits and little padding at the
+                bottom when energy=True.
+        :type vmin: float
+
+        :arg vmax: a maximum value threshold to remove outliers, i.e. only showing data less than vmax
+                This overrides percentile. Default is None, so no axis limits and a little padding for
+                interaction type labels.
+        :type vmax: float
+
+        'IB_solv' and 'IB_nosolv' are derived from empirical potentials from
+        O Keskin, I Bahar and colleagues from [OK98]_ and have RT units.
+
+        'CS' is from MD simulations of amino acid pairs from Carlos Simmerling
+        and Gary Wu for [MR25]_ and have units kcal/mol.
+        """
 
         import numpy as np
         import matplotlib
@@ -3304,87 +5055,172 @@ class Interactions(object):
                'ALA': 'A', 'VAL':'V', 'GLU': 'E', 'TYR': 'Y', 'MET': 'M', 'HSE': 'H', 'HSD': 'H'}
 
         atoms = self._atoms
+        energy = kwargs.pop('energy', False)
+        
+        if not isinstance(energy, bool):
+            raise TypeError('energy should be True or False')
+                    
+        p = kwargs.pop('percentile', None)
+        vmin = vmax = None
+        if p is not None:
+            vmin = np.percentile(matrix, p)
+            vmax = np.percentile(matrix, 100-p)
+
+        vmin = kwargs.pop('vmin', vmin)
+        vmax = kwargs.pop('vmax', vmax)
+
+        selstr = kwargs.pop('selstr', None)
+        if selstr is not None:
+            atoms = atoms.select(selstr)
 
         ResNumb = atoms.select('protein and name CA').getResnums()
         ResName = atoms.select('protein and name CA').getResnames()
         ResChid = atoms.select('protein and name CA').getChids()
         ResList = [ i[0]+str(i[1])+i[2] for i in list(zip([ aa_dic[i] for i in ResName ], ResNumb, ResChid)) ]
         
-        replace_matrix = kwargs.get('replace_matrix', False)
-        matrix_all = self._interactions_matrix
+        if energy == True:
+            matrix_en = self._interactions_matrix_en
+            energy_list_type = kwargs.pop('energy_list_type', 'IB_solv')
+            overwrite = kwargs.pop('overwrite_energies', False)
+            if matrix_en is None or overwrite:
+                LOGGER.warn('The energy matrix is recalculated with type {0}'.format(energy_list_type))
+                self.buildInteractionMatrixEnergy(energy_list_type=energy_list_type)
+                matrix_en = self._interactions_matrix_en
 
-        HBs = kwargs.get('HBs', 1)
-        SBs = kwargs.get('SBs', 1)
-        RIB = kwargs.get('RIB', 1)
-        PiStack = kwargs.get('PiStack', 1)
-        PiCat = kwargs.get('PiCat', 1)
-        HPh = kwargs.get('HPh', 1)
-        DiBs = kwargs.get('DiBs', 1)
-    
-        matrix_hbs = self.buildInteractionMatrix(HBs=HBs, SBs=0, RIB=0,PiStack=0,PiCat=0,HPh=0,DiBs=0)
-        matrix_sbs = self.buildInteractionMatrix(HBs=0, SBs=SBs, RIB=0,PiStack=0,PiCat=0,HPh=0,DiBs=0)
-        matrix_rib = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=RIB,PiStack=0,PiCat=0,HPh=0,DiBs=0)
-        matrix_pistack = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=PiStack,PiCat=0,HPh=0,DiBs=0)
-        matrix_picat = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=0,PiCat=PiCat,HPh=0,DiBs=0)
-        matrix_hph = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=0,PiCat=0,HPh=HPh,DiBs=0)
-        matrix_dibs = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=0,PiCat=0,HPh=0,DiBs=DiBs)
+            elif self._energy_type != energy_list_type:
+                LOGGER.warn('The energy type is {0}, not {1}'.format(self._energy_type, energy_list_type))
 
-        matrix_hbs_sum = np.sum(matrix_hbs, axis=0)
-        matrix_sbs_sum = np.sum(matrix_sbs, axis=0)
-        matrix_rib_sum = np.sum(matrix_rib, axis=0)
-        matrix_pistack_sum = np.sum(matrix_pistack, axis=0)
-        matrix_picat_sum = np.sum(matrix_picat, axis=0)
-        matrix_hph_sum = np.sum(matrix_hph, axis=0)
-        matrix_dibs_sum = np.sum(matrix_dibs, axis=0)
+            matrix_en_sum = np.sum(matrix_en, axis=0)
 
-        width = 0.8
-        fig, ax = plt.subplots(num=None, figsize=(20,6), facecolor='w')
-        matplotlib.rcParams['font.size'] = '24'
+            width = 0.8
+            fig, ax = plt.subplots(num=None, figsize=(20,6), facecolor='w')
+            matplotlib.rcParams['font.size'] = '24'
 
-        sum_matrix = np.zeros(matrix_hbs_sum.shape)
-        pplot(sum_matrix, atoms=atoms.ca)
+            if selstr is not None:
+                matrix_en_sum = sliceAtomicData(matrix_en_sum,
+                                                self._atoms.ca, selstr)
 
-        if HBs != 0:
-            ax.bar(ResList, matrix_hbs_sum, width, color = 'blue', bottom = 0, label='HBs')
-        sum_matrix += matrix_hbs_sum
+            zeros_row = np.zeros(matrix_en_sum.shape)
+            pplot(zeros_row, atoms=atoms.ca, **kwargs)
 
-        if SBs != 0:
-            ax.bar(ResList, matrix_sbs_sum, width, color = 'yellow', bottom = sum_matrix, label='SBs')
-        sum_matrix += matrix_sbs_sum
+            ax.bar(ResList, matrix_en_sum, width, color='blue')
+            
+            if vmin is None:
+                vmin = np.min(matrix_en_sum) * 1.2
 
-        if HPh != 0:
-            ax.bar(ResList, matrix_hph_sum, width, color = 'silver', bottom = sum_matrix, label='HPh')
-        sum_matrix += matrix_hph_sum
+            if vmax is None:
+                vmax = np.max(matrix_en_sum)
+
+            plt.ylim([vmin, vmax])
+            plt.tight_layout()    
+            plt.xlabel('Residue')
+
+            unit = 'RT' if energy_list_type in ['IB_solv', 'IB_nosolv'] else 'kcal/mol'
+            plt.ylabel('Cumulative Energy [{0}]'.format(unit))
+            plt.show()
+            
+            return matrix_en_sum
         
-        if RIB != 0:
-            ax.bar(ResList, matrix_rib_sum, width, color = 'red', bottom = sum_matrix, label='RIB')
-        sum_matrix += matrix_rib_sum
-
-        if PiStack != 0:
-            ax.bar(ResList, matrix_pistack_sum, width, color = 'green', bottom = sum_matrix, label='PiStack')
-        sum_matrix += matrix_pistack_sum
-
-        if PiCat != 0:
-            ax.bar(ResList, matrix_picat_sum, width, color = 'orange', bottom = sum_matrix, label='PiCat')
-        sum_matrix += matrix_picat_sum
-        
-        if DiBs != 0:
-            ax.bar(ResList, matrix_dibs_sum, width, color = 'black', bottom = sum_matrix, label='DiBs')
-        sum_matrix += matrix_dibs_sum
-
-        if replace_matrix:
-            self._interactions_matrix = np.sum([matrix_hbs, matrix_sbs, matrix_rib, matrix_pistack,
-                                                matrix_picat, matrix_hph, matrix_dibs], axis=0)
         else:
-            self._interactions_matrix = matrix_all
+            replace_matrix = kwargs.get('replace_matrix', False)
+            matrix_all = self._interactions_matrix
 
-        ax.legend(ncol=7, loc='upper center')
-        plt.ylim([0,max(sum_matrix)+3])
-        plt.tight_layout()    
-        plt.xlabel('Residue')
-        plt.ylabel('Number of counts')
-       
-        return matrix_hbs_sum, matrix_sbs_sum, matrix_rib_sum, matrix_pistack_sum, matrix_picat_sum, matrix_hph_sum, matrix_dibs_sum 
+            HBs = kwargs.get('HBs', 1)
+            SBs = kwargs.get('SBs', 1)
+            RIB = kwargs.get('RIB', 1)
+            PiStack = kwargs.get('PiStack', 1)
+            PiCat = kwargs.get('PiCat', 1)
+            HPh = kwargs.get('HPh', 1)
+            DiBs = kwargs.get('DiBs', 1)
+        
+            matrix_hbs = self.buildInteractionMatrix(HBs=HBs, SBs=0, RIB=0,PiStack=0,PiCat=0,HPh=0,DiBs=0)
+            matrix_sbs = self.buildInteractionMatrix(HBs=0, SBs=SBs, RIB=0,PiStack=0,PiCat=0,HPh=0,DiBs=0)
+            matrix_rib = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=RIB,PiStack=0,PiCat=0,HPh=0,DiBs=0)
+            matrix_pistack = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=PiStack,PiCat=0,HPh=0,DiBs=0)
+            matrix_picat = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=0,PiCat=PiCat,HPh=0,DiBs=0)
+            matrix_hph = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=0,PiCat=0,HPh=HPh,DiBs=0)
+            matrix_dibs = self.buildInteractionMatrix(HBs=0, SBs=0, RIB=0,PiStack=0,PiCat=0,HPh=0,DiBs=DiBs)
+
+            matrix_hbs_sum = np.sum(matrix_hbs, axis=0)
+            matrix_sbs_sum = np.sum(matrix_sbs, axis=0)
+            matrix_rib_sum = np.sum(matrix_rib, axis=0)
+            matrix_pistack_sum = np.sum(matrix_pistack, axis=0)
+            matrix_picat_sum = np.sum(matrix_picat, axis=0)
+            matrix_hph_sum = np.sum(matrix_hph, axis=0)
+            matrix_dibs_sum = np.sum(matrix_dibs, axis=0)
+
+            all_ca = self._atoms.ca
+            if selstr is not None:
+                matrix_hbs_sum = sliceAtomicData(matrix_hbs_sum,
+                                                 all_ca, selstr)
+                matrix_sbs_sum = sliceAtomicData(matrix_sbs_sum,
+                                                 all_ca, selstr)
+                matrix_rib_sum = sliceAtomicData(matrix_rib_sum,
+                                                 all_ca, selstr)
+                matrix_pistack_sum = sliceAtomicData(matrix_pistack_sum,
+                                                     all_ca, selstr)
+                matrix_picat_sum = sliceAtomicData(matrix_picat_sum,
+                                                   all_ca, selstr)
+                matrix_hph_sum = sliceAtomicData(matrix_hph_sum,
+                                                 all_ca, selstr)
+                matrix_dibs_sum = sliceAtomicData(matrix_dibs_sum,
+                                                  all_ca, selstr)
+
+            width = 0.8
+            fig, ax = plt.subplots(num=None, figsize=(20,6), facecolor='w')
+            matplotlib.rcParams['font.size'] = '24'
+
+            sum_matrix = np.zeros(matrix_hbs_sum.shape)
+            pplot(sum_matrix, atoms=atoms.ca)
+
+            if HBs != 0:
+                ax.bar(ResList, matrix_hbs_sum, width, color = 'blue', bottom = 0, label='HBs')
+            sum_matrix += matrix_hbs_sum
+
+            if SBs != 0:
+                ax.bar(ResList, matrix_sbs_sum, width, color = 'yellow', bottom = sum_matrix, label='SBs')
+            sum_matrix += matrix_sbs_sum
+
+            if HPh != 0:
+                ax.bar(ResList, matrix_hph_sum, width, color = 'silver', bottom = sum_matrix, label='HPh')
+            sum_matrix += matrix_hph_sum
+            
+            if RIB != 0:
+                ax.bar(ResList, matrix_rib_sum, width, color = 'red', bottom = sum_matrix, label='RIB')
+            sum_matrix += matrix_rib_sum
+
+            if PiStack != 0:
+                ax.bar(ResList, matrix_pistack_sum, width, color = 'green', bottom = sum_matrix, label='PiStack')
+            sum_matrix += matrix_pistack_sum
+
+            if PiCat != 0:
+                ax.bar(ResList, matrix_picat_sum, width, color = 'orange', bottom = sum_matrix, label='PiCat')
+            sum_matrix += matrix_picat_sum
+            
+            if DiBs != 0:
+                ax.bar(ResList, matrix_dibs_sum, width, color = 'black', bottom = sum_matrix, label='DiBs')
+            sum_matrix += matrix_dibs_sum
+
+            if replace_matrix:
+                self._interactions_matrix = np.sum([matrix_hbs, matrix_sbs, matrix_rib, matrix_pistack,
+                                                    matrix_picat, matrix_hph, matrix_dibs], axis=0)
+            else:
+                self._interactions_matrix = matrix_all
+
+            ax.legend(ncol=7, loc='upper center')
+
+            if vmin is None:
+                vmin = np.min(sum_matrix)
+
+            if vmax is None:
+                vmax = np.max(sum_matrix) * 1.5
+
+            plt.ylim([vmin, vmax])
+            plt.tight_layout()    
+            plt.xlabel('Residue')
+            plt.ylabel('Number of counts')
+        
+            return matrix_hbs_sum, matrix_sbs_sum, matrix_rib_sum, matrix_pistack_sum, matrix_picat_sum, matrix_hph_sum, matrix_dibs_sum 
       
         
 class InteractionsTrajectory(object):
@@ -3439,6 +5275,10 @@ class InteractionsTrajectory(object):
         :arg stop_frame: index of last frame to read
         :type stop_frame: int
     
+        :arg max_proc: maximum number of processes to use
+            default is half of the number of CPUs
+        :type max_proc: int
+
         Selection:
         If we want to select interactions for the particular residue or group of residues: 
             selection='chain A and resid 1 to 50'
@@ -3454,122 +5294,142 @@ class InteractionsTrajectory(object):
             except TypeError:
                 raise TypeError('coords must be an object '
                                 'with `getCoords` method')
-        
-        HBs_all = []
-        SBs_all = []
-        RIB_all = []
-        PiStack_all = []
-        PiCat_all = []
-        HPh_all = []
-        DiBs_all = []
-
-        HBs_nb = []
-        SBs_nb = []
-        RIB_nb = []
-        PiStack_nb = []
-        PiCat_nb = []
-        HPh_nb = []
-        DiBs_nb = []
 
         start_frame = kwargs.pop('start_frame', 0)
         stop_frame = kwargs.pop('stop_frame', -1)
+        max_proc = kwargs.pop('max_proc', mp.cpu_count()//2)
 
-        if trajectory is not None:
-            if isinstance(trajectory, Atomic):
-                trajectory = Ensemble(trajectory)
-        
+        if trajectory is None:
+            if atoms.numCoordsets() > 1:
+                trajectory = atoms
+            else:
+                LOGGER.info('Include trajectory or use multi-model PDB file.')
+                return interactions_nb_traj
+
+        if isinstance(trajectory, Atomic):
+            trajectory = Ensemble(trajectory)
+    
+        if isinstance(trajectory, Trajectory):
             nfi = trajectory._nfi
             trajectory.reset()
-            numFrames = trajectory._n_csets
+        numFrames = trajectory._n_csets
 
-            if stop_frame == -1:
-                traj = trajectory[start_frame:]
-            else:
-                traj = trajectory[start_frame:stop_frame+1]
-
-            atoms_copy = atoms.copy()
-            protein = atoms_copy.protein
-
-            for j0, frame0 in enumerate(traj, start=start_frame):
-                LOGGER.info('Frame: {0}'.format(j0))
-                atoms_copy.setCoords(frame0.getCoords())
-                
-                hydrogen_bonds = calcHydrogenBonds(protein, **kwargs)
-                salt_bridges = calcSaltBridges(protein, **kwargs)
-                RepulsiveIonicBonding = calcRepulsiveIonicBonding(protein, **kwargs)
-                Pi_stacking = calcPiStacking(protein, **kwargs)
-                Pi_cation = calcPiCation(protein, **kwargs)
-                hydrophobic = calcHydrophobic(protein, **kwargs)
-                Disulfide_Bonds = calcDisulfideBonds(protein, **kwargs)
-
-                HBs_all.append(hydrogen_bonds)
-                SBs_all.append(salt_bridges)
-                RIB_all.append(RepulsiveIonicBonding)
-                PiStack_all.append(Pi_stacking)
-                PiCat_all.append(Pi_cation)
-                HPh_all.append(hydrophobic)
-                DiBs_all.append(Disulfide_Bonds)
-            
-                HBs_nb.append(len(hydrogen_bonds))
-                SBs_nb.append(len(salt_bridges))
-                RIB_nb.append(len(RepulsiveIonicBonding))
-                PiStack_nb.append(len(Pi_stacking))
-                PiCat_nb.append(len(Pi_cation))
-                HPh_nb.append(len(hydrophobic))
-                DiBs_nb.append(len(Disulfide_Bonds))
-      
+        if stop_frame == -1:
+            traj = trajectory[start_frame:]
         else:
-            if atoms.numCoordsets() > 1:
-                for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
-                    LOGGER.info('Model: {0}'.format(i+start_frame))
-                    atoms.setACSIndex(i+start_frame) 
-                    protein = atoms.select('protein')
-                    
-                    hydrogen_bonds = calcHydrogenBonds(atoms.protein, **kwargs)
-                    salt_bridges = calcSaltBridges(atoms.protein, **kwargs)
-                    RepulsiveIonicBonding = calcRepulsiveIonicBonding(atoms.protein, **kwargs)
-                    Pi_stacking = calcPiStacking(atoms.protein, **kwargs)
-                    Pi_cation = calcPiCation(atoms.protein, **kwargs)
-                    hydrophobic = calcHydrophobic(atoms.protein, **kwargs)
-                    Disulfide_Bonds = calcDisulfideBonds(atoms.protein, **kwargs)
+            traj = trajectory[start_frame:stop_frame+1]
 
-                    HBs_all.append(hydrogen_bonds)
-                    SBs_all.append(salt_bridges)
-                    RIB_all.append(RepulsiveIonicBonding)
-                    PiStack_all.append(Pi_stacking)
-                    PiCat_all.append(Pi_cation)
-                    HPh_all.append(hydrophobic)
-                    DiBs_all.append(Disulfide_Bonds)
+        HBs_all = [[] for _ in traj]
+        SBs_all = [[] for _ in traj]
+        RIB_all = [[] for _ in traj]
+        PiStack_all = [[] for _ in traj]
+        PiCat_all = [[] for _ in traj]
+        HPh_all = [[] for _ in traj]
+        DiBs_all = [[] for _ in traj]
+
+        HBs_nb = [[] for _ in traj]
+        SBs_nb = [[] for _ in traj]
+        RIB_nb = [[] for _ in traj]
+        PiStack_nb = [[] for _ in traj]
+        PiCat_nb = [[] for _ in traj]
+        HPh_nb = [[] for _ in traj]
+        DiBs_nb = [[] for _ in traj]
+
+        interactions_traj = [HBs_all, SBs_all, RIB_all, PiStack_all, PiCat_all, HPh_all, DiBs_all]
+        interactions_nb_traj = [HBs_nb, SBs_nb, RIB_nb, PiStack_nb, PiCat_nb, HPh_nb, DiBs_nb]
+
+        atoms_copy = atoms.copy()
+        protein = atoms_copy.protein
+
+        def analyseFrame(j0, frame0, interactions_all, interactions_nb):
+            LOGGER.info('Frame: {0}'.format(j0))
+            atoms_copy.setCoords(frame0.getCoords())
+
+            ind = j0 - start_frame
             
-                    HBs_nb.append(len(hydrogen_bonds))
-                    SBs_nb.append(len(salt_bridges))
-                    RIB_nb.append(len(RepulsiveIonicBonding))
-                    PiStack_nb.append(len(Pi_stacking))
-                    PiCat_nb.append(len(Pi_cation))
-                    HPh_nb.append(len(hydrophobic))
-                    DiBs_nb.append(len(Disulfide_Bonds))
-            else:
-                LOGGER.info('Include trajectory or use multi-model PDB file.') 
+            hydrogen_bonds = calcHydrogenBonds(protein, **kwargs)
+            salt_bridges = calcSaltBridges(protein, **kwargs)
+            RepulsiveIonicBonding = calcRepulsiveIonicBonding(protein, **kwargs)
+            Pi_stacking = calcPiStacking(protein, **kwargs)
+            Pi_cation = calcPiCation(protein, **kwargs)
+            hydrophobic = calcHydrophobic(protein, **kwargs)
+            Disulfide_Bonds = calcDisulfideBonds(protein, **kwargs)
+
+            interactions_all[0][ind].extend(hydrogen_bonds)
+            interactions_all[1][ind].extend(salt_bridges)
+            interactions_all[2][ind].extend(RepulsiveIonicBonding)
+            interactions_all[3][ind].extend(Pi_stacking)
+            interactions_all[4][ind].extend(Pi_cation)
+            interactions_all[5][ind].extend(hydrophobic)
+            interactions_all[6][ind].extend(Disulfide_Bonds)
+
+            interactions_nb[0][ind].append(len(hydrogen_bonds))
+            interactions_nb[1][ind].append(len(salt_bridges))
+            interactions_nb[2][ind].append(len(RepulsiveIonicBonding))
+            interactions_nb[3][ind].append(len(Pi_stacking))
+            interactions_nb[4][ind].append(len(Pi_cation))
+            interactions_nb[5][ind].append(len(hydrophobic))
+            interactions_nb[6][ind].append(len(Disulfide_Bonds))
+
+        if max_proc == 1:
+            interactions_all = interactions_traj
+            interactions_nb = interactions_nb_traj
+            for j0, frame0 in enumerate(traj, start=start_frame):
+                analyseFrame(j0, frame0, interactions_all, interactions_nb)
+            interactions_nb =  [[item[0] for item in row] for row in interactions_nb]
+        else:
+            with mp.Manager() as manager:
+                interactions_all = manager.list()
+                interactions_nb = manager.list()
+                for row in interactions_traj:
+                    interactions_all.append([manager.list() for _ in row])
+                    interactions_nb.append([manager.list() for _ in row])
+
+                j0 = start_frame
+                while j0 < traj.numConfs()+start_frame:
+
+                    processes = []
+                    for _ in range(max_proc):
+                        frame0 = traj[j0-start_frame]
+                        
+                        p = mp.Process(target=analyseFrame, args=(j0, frame0,
+                                                                  interactions_all,
+                                                                  interactions_nb))
+                        p.start()
+                        processes.append(p)
+
+                        j0 += 1
+                        if j0 >= traj.numConfs()+start_frame:
+                            break
+
+                    for p in processes:
+                        p.join()
+
+                interactions_all = [[item[:] for item in row] for row in interactions_all]
+                interactions_nb =  [[item[0] for item in row] for row in interactions_nb]
         
         self._atoms = atoms
         self._traj = trajectory
-        self._interactions_traj = [HBs_all, SBs_all, RIB_all, PiStack_all, PiCat_all, HPh_all, DiBs_all]
-        self._interactions_nb_traj = [HBs_nb, SBs_nb, RIB_nb, PiStack_nb, PiCat_nb, HPh_nb, DiBs_nb]
-        self._hbs_traj = HBs_all
-        self._sbs_traj = SBs_all  
-        self._rib_traj = RIB_all
-        self._piStack_traj = PiStack_all
-        self._piCat_traj = PiCat_all
-        self._hps_traj = HPh_all
-        self._dibs_traj = DiBs_all
+        self._interactions_traj = interactions_all
+        self._interactions_nb_traj = interactions_nb
+        self._hbs_traj = interactions_all[0]
+        self._sbs_traj = interactions_all[1]
+        self._rib_traj = interactions_all[2]
+        self._piStack_traj = interactions_all[3]
+        self._piCat_traj = interactions_all[4]
+        self._hps_traj = interactions_all[5]
+        self._dibs_traj = interactions_all[6]
         
         if filename is not None:
             import pickle
             with open(str(filename)+'.pkl', 'wb') as f:
                 pickle.dump(self._interactions_traj, f)  
             LOGGER.info('File with interactions saved.')
+
+        if isinstance(trajectory, Trajectory):
+            trajectory._nfi = nfi
             
-        return HBs_nb, SBs_nb, RIB_nb, PiStack_nb, PiCat_nb, HPh_nb, DiBs_nb
+        return interactions_nb
 
 
     def getInteractions(self, **kwargs):
@@ -3580,19 +5440,60 @@ class InteractionsTrajectory(object):
     
         :arg selection2: selection string
         :type selection2: str 
-            
+        
+        :arg replace: Used with selection criteria to set the new one
+                      If set to **True** the selection will be replaced by the new one.
+                      Default is **False**
+        :type replace: bool
+
         Selection:
         If we want to select interactions for the particular residue or group of residues: 
             selection='chain A and resid 1 to 50'
         If we want to study chain-chain interactions:
             selection='chain A', selection2='chain B'  """
-
+        
+        replace = kwargs.pop('replace', False)
+        
         if len(kwargs) != 0:
             sele_inter = []
             for i in self._interactions_traj:
                 for nr_j,j in enumerate(i):
                     sele_inter.append(filterInteractions(i[nr_j], self._atoms, **kwargs))
+            
+            if replace == True:
+                try:
+                    trajectory = self._traj
+                    numFrames = trajectory._n_csets
+                except:
+                    # If we analyze previously saved PKL file it doesn't have dcd information
+                    # We have seven type of interactions. It will give number of frames.
+                    numFrames = int(len(sele_inter)/7)
+                    
+                self._interactions_traj = sele_inter
+                self._hbs_traj = sele_inter[0:numFrames]
+                self._sbs_traj = sele_inter[numFrames:2*numFrames]
+                self._rib_traj = sele_inter[2*numFrames:3*numFrames]
+                self._piStack_traj = sele_inter[3*numFrames:4*numFrames]
+                self._piCat_traj = sele_inter[4*numFrames:5*numFrames]
+                self._hps_traj = sele_inter[5*numFrames:6*numFrames]
+                self._dibs_traj = sele_inter[6*numFrames:7*numFrames]
+                LOGGER.info('New interactions are set')
+                
+                self._interactions_nb_traj = None
+                self._interactions_matrix_traj = None
+                
+                new_interactions_nb_traj = []
+                new_interactions_nb_traj.append([ len(i) for i in self._hbs_traj ])
+                new_interactions_nb_traj.append([ len(i) for i in self._sbs_traj ])
+                new_interactions_nb_traj.append([ len(i) for i in self._rib_traj ])
+                new_interactions_nb_traj.append([ len(i) for i in self._piStack_traj ])
+                new_interactions_nb_traj.append([ len(i) for i in self._piCat_traj ])
+                new_interactions_nb_traj.append([ len(i) for i in self._hps_traj ])
+                new_interactions_nb_traj.append([ len(i) for i in self._dibs_traj ])
+                self._interactions_nb_traj = new_interactions_nb_traj
+                
             results = sele_inter
+        
         else: 
             results = self._interactions_traj
         
@@ -4031,8 +5932,9 @@ class LigandInteractionsTrajectory(object):
             if isinstance(trajectory, Atomic):
                 trajectory = Ensemble(trajectory)
         
-            nfi = trajectory._nfi
-            trajectory.reset()
+            if isinstance(trajectory, Trajectory):
+                nfi = trajectory._nfi
+                trajectory.reset()
             numFrames = trajectory._n_csets
 
             if stop_frame == -1:
@@ -4101,7 +6003,7 @@ class LigandInteractionsTrajectory(object):
         :arg include_frames: used with filters, it will leave selected keyword in orginal 
                     lists, if False it will collect selected interactions in one list,
                     Use True to assign new selection using setLigandInteractions.
-                    by default True
+                    Default is True
         :type include_frames: bool            
         """
         
@@ -4151,7 +6053,7 @@ class LigandInteractionsTrajectory(object):
         be a total number of interactions or it can be divided into interaction types.
         
         :arg types: Interaction types can be included (True) or not (False).
-                    by default is True. 
+                    Default is True. 
         :type types: bool
         """
 
@@ -4293,7 +6195,7 @@ class LigandInteractionsTrajectory(object):
         :type filename: str  
         
         :arg ligand_sele: ligand selection,
-                          by default is 'all not (protein or water or ion)'.
+                          Default is 'all not (protein or water or ion)'.
         :type ligand_sele: str          
         """
         
@@ -4344,1152 +6246,4 @@ class LigandInteractionsTrajectory(object):
             LOGGER.info('PDB file saved.')
 
         return freq_contacts_list
-       
-
-    
-
-
-
-
-
-
-def checkAndImport(package_name):
-    """Check for package and import it if possible and return **True**.
-    Otherwise, return **False
-        
-    :arg package_name: name of package
-    :type package_name: str
-
-    :arg import_command: optional command to import submodules or with an alias
-        default **None** means use "import {0}".format(package_name)
-    :type import_command: None, str
-    """
-    if not isinstance(package_name, str):
-        raise TypeError('package_name should be a string')
-
-    import importlib.util
-    if importlib.util.find_spec(package_name) is None:
-        LOGGER.warn("Package " + str(package_name) + " is not installed. Please install it to use this function.")
-        return False
-    return True
-
-def getVmdModel(vmd_path, atoms):
-    """
-    Generates a 3D model of molecular structures using VMD and returns it as an Open3D TriangleMesh.
-
-    This function creates a temporary PDB file from the provided atomic data and uses VMD (Visual Molecular Dynamics)
-    to render this data into an STL file, which is then loaded into Open3D as a TriangleMesh. The function handles
-    the creation and cleanup of temporary files and manages the subprocess call to VMD.
-
-    :param vmd_path: Path to the VMD executable. This is required to run VMD and execute the TCL script.
-    :type vmd_path: str
-
-    :param atoms: Atomic data to be written to a PDB file. This should be an object or data structure
-        that is compatible with the `writePDB` function.
-    :type atoms: object
-
-    :raises ImportError: If required libraries ('subprocess', 'pathlib', 'tempfile', 'open3d') are not installed,
-        an ImportError is raised, specifying which libraries are missing.
-
-    :raises ValueError: If the STL file is not created or is empty, or if the STL file cannot be read as a TriangleMesh,
-        a ValueError is raised.
-
-    :returns: An Open3D TriangleMesh object representing the 3D model generated from the PDB data.
-    :rtype: open3d.geometry.TriangleMesh
-
-    Example usage:
-    model = getVmdModel('/path/to/vmd', atoms)
-    """
-    
-    required = ['subprocess', 'pathlib', 'tempfile', 'open3d']
-    missing = []
-    errorMsg = None
-    for name in required:
-        if not checkAndImport(name):
-            missing.append(name)
-            if errorMsg is None:
-                errorMsg = 'To run getVmdModel, please install {0}'.format(missing[0])
-            else:
-                errorMsg += ', ' + name
-
-    if len(missing) > 0:
-        if len(missing) > 1:
-            errorMsg = ', '.join(errorMsg.split(', ')[:-1]) + ' and ' + errorMsg.split(', ')[-1]
-        raise ImportError(errorMsg)
-
-    import subprocess
-    from pathlib import Path
-    import tempfile
-    import open3d as o3d
-
-    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as temp_pdb:
-        temp_pdb_path = Path(temp_pdb.name)
-        writePDB(temp_pdb.name, atoms)
-    
-    with tempfile.NamedTemporaryFile(suffix=".tcl", delete=False) as temp_script:
-        temp_script_path = Path(temp_script.name)
-        
-        output_path = temp_script_path.parent / "output.stl"
-        
-        vmd_script = """
-        set file_path [lindex $argv 0]
-        set output_path [lindex $argv 1]
-
-        mol new $file_path
-        mol modstyle 0 0 NewCartoon
-
-        set id_matrix {{1 0 0 0} {0 1 0 0} {0 0 1 0} {0 0 0 1}}
-        molinfo top set center_matrix [list $id_matrix]
-        molinfo top set rotate_matrix [list $id_matrix]
-        molinfo top set scale_matrix [list $id_matrix]
-
-        rendering_method stl
-        render STL $output_path
-
-        exit
-        """
-        
-        temp_script.write(vmd_script.encode('utf-8'))
-    
-    command = [vmd_path, '-e', str(temp_script_path), '-args', str(temp_pdb_path), str(output_path)]
-    
-    try:
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError as e:
-        LOGGER.info("VMD exited with status " + str(e.returncode) + ".")
-    except Exception as e:
-        LOGGER.warn("An unexpected error occurred: " + str(e))
-    finally:
-        temp_script_path.unlink(missing_ok=True)
-        temp_pdb_path.unlink(missing_ok=True)
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise ValueError("STL file was not created or is empty.")
-            
-        stl_mesh = o3d.io.read_triangle_mesh(str(output_path))
-            
-        if stl_mesh.is_empty():
-            raise ValueError("Failed to read the STL file as a TriangleMesh.")
-            
-        if output_path.exists():
-            output_path.unlink(missing_ok=True)
-            
-        LOGGER.info("Model created successfully.")
-        return stl_mesh
-
-def showChannels(channels, model=None, surface=None):
-    """
-    Visualizes the channels, and optionally, the molecular model and surface, using Open3D.
-    
-    This function renders a 3D visualization of molecular channels based on their spline representations.
-    It can also display a molecular model (e.g., the protein structure) and a surface (e.g., cavity surface)
-    in the same visualization. The function utilizes the Open3D library to create and render the 3D meshes.
-    
-    :arg channels: A list of channel objects or a single channel object. Each channel should have a 
-        `get_splines()` method that returns two CubicSpline objects: one for the centerline and one for the radii.
-    :type channels: list or single channel object
-    
-    :arg model: An optional Open3D TriangleMesh object representing the molecular model, such as a protein.
-        If provided, this model will be rendered in the visualization.
-    :type model: open3d.geometry.TriangleMesh, optional
-    
-    :arg surface: An optional list containing the surface data. The list should have two elements:
-        - `points`: The coordinates of the vertices on the surface.
-        - `simp`: The simplices that define the surface (e.g., triangles or tetrahedra).
-        If provided, the surface will be rendered as a wireframe overlay in the visualization.
-    :type surface: list (with two numpy arrays), optional
-    
-    :raises ImportError: If the Open3D library is not installed, an ImportError is raised,
-        prompting the user to install Open3D.
-    
-    :returns: None. This function only renders the visualization.
-    
-    Example usage:
-    showChannels(channels, model=protein_mesh, surface=surface_data)
-    """
-    
-    if not checkAndImport('open3d'):
-        errorMsg = 'To run showChannels, please install open3d.'
-        raise ImportError(errorMsg)
-            
-    import open3d as o3d
-    
-    def create_mesh_from_spline(centerline_spline, radius_spline, n=5):
-        N = n * len(centerline_spline.x)
-        t = np.linspace(centerline_spline.x[0], centerline_spline.x[-1], N)
-        centers = centerline_spline(t)
-        radii = radius_spline(t)
-
-        spheres = [o3d.geometry.TriangleMesh.create_sphere(radius=r, resolution=20).translate(c) for r, c in zip(radii, centers)]
-        mesh = spheres[0]
-        for sphere in spheres[1:]:
-            mesh += sphere
-
-        return mesh
-    
-    if not isinstance(channels, list):
-        channels = [channels]
-    
-    channel_meshes = [create_mesh_from_spline(*channel.get_splines()) for channel in channels]
-    meshes_to_visualize = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])]
-
-    if model is not None:
-        model.compute_vertex_normals()
-        model.paint_uniform_color([0.1, 0.7, 0.3])
-        meshes_to_visualize.append(model)
-            
-    if channel_meshes is not None:
-        if not isinstance(channel_meshes, list):
-            channel_meshes = [channel_meshes]
-        for channel_mesh in channel_meshes:
-            channel_mesh.compute_vertex_normals()
-            channel_mesh.paint_uniform_color([0.5, 0.0, 0.5])
-        meshes_to_visualize.extend(channel_meshes)
-        
-    if surface is not None:
-        points = surface[0]
-        simp = surface[1]
-        
-        triangles = []
-        for tetra in simp:
-            triangles.extend([sorted([tetra[0], tetra[1], tetra[2]]),
-                                  sorted([tetra[0], tetra[1], tetra[3]]),
-                                  sorted([tetra[0], tetra[2], tetra[3]]),
-                                  sorted([tetra[1], tetra[2], tetra[3]])])
-            
-        triangles = np.array(triangles)
-        triangles.sort(axis=1)
-            
-        triangles_tuple = [tuple(tri) for tri in triangles]
-        unique_triangles, counts = np.unique(triangles_tuple, return_counts=True, axis=0)
-            
-        surface_triangles = unique_triangles[counts == 1]
-            
-        lines = []
-        for simplex in surface_triangles:
-            for i in range(3):
-                for j in range(i + 1, 3):
-                    lines.append([simplex[i], simplex[j]])
-            
-        line_set = o3d.geometry.LineSet()
-        line_set.points = o3d.utility.Vector3dVector(points)
-        line_set.lines = o3d.utility.Vector2iVector(lines)
-        
-        meshes_to_visualize.append(line_set)
-        
-    if len(meshes_to_visualize) > 1:
-        o3d.visualization.draw_geometries(meshes_to_visualize)
-    else:
-        LOGGER.info("Nothing to visualize.")
-
-def showCavities(surface, show_surface=False):
-    """
-    Visualizes the cavities within a molecular surface using Open3D.
-
-    This function displays a 3D visualization of cavities detected in a molecular structure.
-    It uses the Open3D library to render the cavities as a triangle mesh. Optionally, it can also
-    display the molecular surface as a wireframe overlay.
-
-    :arg surface: A list containing three elements:
-        - `points`: The coordinates of the vertices (atoms) in the molecular structure.
-        - `surf_simp`: The simplices that define the molecular surface.
-        - `simp_cavities`: The simplices corresponding to the detected cavities.
-    :type surface: list (with three numpy arrays)
-
-    :arg show_surface: A boolean flag indicating whether to display the molecular surface
-        as a wireframe overlay in the visualization. If True, the surface will be displayed
-        in addition to the cavities. Default is False.
-    :type show_surface: bool
-
-    :raises ImportError: If the Open3D library is not installed, an ImportError is raised,
-        prompting the user to install Open3D.
-
-    :returns: None
-
-    Example usage:
-    showCavities(surface_data, show_surface=True)
-    """
-    
-    if not checkAndImport('open3d'):
-        errorMsg = 'To run showChannels, please install open3d.'
-        raise ImportError(errorMsg)
-            
-    import open3d as o3d
-    
-    points = surface[0]
-    surf_simp = surface[1]
-    simp_cavities = surface[2]
-    
-    triangles = []
-    for tetra in simp_cavities:
-        triangles.extend([sorted([tetra[0], tetra[1], tetra[2]]),
-                          sorted([tetra[0], tetra[1], tetra[3]]),
-                          sorted([tetra[0], tetra[2], tetra[3]]),
-                          sorted([tetra[1], tetra[2], tetra[3]])])
-        
-    surface_triangles = np.unique(np.array(triangles), axis=0, return_counts=True)[0]
-        
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(points)
-    mesh.triangles = o3d.utility.Vector3iVector(surface_triangles)
-        
-    mesh.compute_vertex_normals()
-    mesh.paint_uniform_color([0.1, 0.7, 0.3])
-        
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    vis.add_geometry(mesh)
-        
-    if show_surface == True:
-        triangles = []
-        for tetra in surf_simp:
-            triangles.extend([sorted([tetra[0], tetra[1], tetra[2]]),
-                                  sorted([tetra[0], tetra[1], tetra[3]]),
-                                  sorted([tetra[0], tetra[2], tetra[3]]),
-                                  sorted([tetra[1], tetra[2], tetra[3]])])
-            
-        triangles = np.array(triangles)
-        triangles.sort(axis=1)
-            
-        triangles_tuple = [tuple(tri) for tri in triangles]
-        unique_triangles, counts = np.unique(triangles_tuple, return_counts=True, axis=0)
-            
-        surface_triangles = unique_triangles[counts == 1]
-            
-        lines = []
-        for simplex in surface_triangles:
-            for i in range(3):
-                for j in range(i + 1, 3):
-                    lines.append([simplex[i], simplex[j]])
-            
-        line_set = o3d.geometry.LineSet()
-        line_set.points = o3d.utility.Vector3dVector(points)
-        line_set.lines = o3d.utility.Vector2iVector(lines)
-        
-        vis.add_geometry(line_set)
-            
-    vis.get_render_option().mesh_show_back_face = True
-    vis.get_render_option().background_color = np.array([1, 1, 1])
-    vis.update_renderer()
-    vis.run()
-    vis.destroy_window()
-
-def calcChannels(atoms, output_path=None, separate=False, r1=3, r2=1.25, min_depth=10, bottleneck=1, sparsity=15):
-    """
-    Computes and identifies channels within a molecular structure using Voronoi and Delaunay tessellations.
-
-    This function analyzes the provided atomic structure to detect channels, which are voids or pathways
-    within the molecular structure. It employs Voronoi and Delaunay tessellations to identify these regions,
-    then filters and refines the detected channels based on various parameters such as the minimum depth
-    and bottleneck size. The results can be saved to a PDB file if an output path is provided. The `separate` 
-    parameter controls whether each detected channel is saved to a separate file or if all channels are saved 
-    in a single file.
-
-    The implementation is inspired by the methods described in the publication:
-    "MOLE 2.0: advanced approach for analysis of biomacromolecular channels" by M. Berka, M. B. G. Czajka,
-    J. P. M. T. Doyle, and M. T. L. Smith, published in Nucleic Acids Research, 2014.
-
-    :param atoms: An object representing the molecular structure, typically containing atomic coordinates
-        and element types.
-    :type atoms: `Atoms` object
-
-    :param output_path: Optional path to save the resulting channels and associated data in PDB format.
-        If None, results are not saved. Default is None.
-    :type output_path: str or None
-
-    :param separate: If True, each detected channel is saved to a separate PDB file. If False, all channels
-        are saved in a single PDB file. Default is False.
-    :type separate: bool
-
-    :param r1: The first radius threshold used during the deletion of simplices, which is used to define 
-        the outer surface of the channels. Default is 3.
-    :type r1: float
-
-    :param r2: The second radius threshold used to define the inner surface of the channels. Default is 1.25.
-    :type r2: float
-
-    :param min_depth: The minimum depth a cavity must have to be considered as a channel. Default is 10.
-    :type min_depth: float
-
-    :param bottleneck: The minimum allowed bottleneck size (narrowest point) for the channels. Default is 1.
-    :type bottleneck: float
-
-    :param sparsity: The sparsity parameter controls the sampling density when analyzing the molecular surface.
-        A higher value results in fewer sampling points. Default is 15.
-    :type sparsity: int
-
-    :returns: A tuple containing two elements:
-        - `channels`: A list of detected channels, where each channel is an object containing information
-          about its path and geometry.
-        - `surface`: A list containing additional information for further visualization, including
-          the atomic coordinates, simplices defining the surface, and merged cavities.
-    :rtype: tuple (list, list)
-
-    This function performs the following steps:
-    1. **Selection and Filtering:** Selects non-hetero atoms from the protein, calculates van der Waals radii, and performs
-       3D Delaunay triangulation and Voronoi tessellation on the coordinates.
-    2. **State Management:** Creates and updates different stages of channel detection of the protein structure to filter out simplices 
-        based on the given radii.
-    3. **Surface Layer Calculation:** Determines the surface and second-layer simplices from the filtered results.
-    4. **Cavity and Channel Detection:** Finds and filters cavities based on their depth and calculates channels using
-       Dijkstra's algorithm.
-    5. **Visualization and Saving:** Generates meshes for the detected channels, filters them by bottleneck size, and either
-       saves the results to a PDB file or visualizes them based on the specified parameters.
-       
-    Example usage:
-    channels, surface = calcChannels(atoms, output_path="channels.pdb", separate=False, r1=3, r2=1.25, min_depth=10, bottleneck=1, sparsity=15)
-    """
-    
-    required = ['heapq', 'collections', 'scipy', 'pathlib', 'warnings']
-    missing = []
-    errorMsg = None
-    for name in required:
-        if not checkAndImport(name):
-            missing.append(name)
-            if errorMsg is None:
-                errorMsg = 'To run calcChannels, please install {0}'.format(missing[0])
-            else:
-                errorMsg += ', ' + name
-
-    if len(missing) > 0:
-        if len(missing) > 1:
-            errorMsg = ', '.join(errorMsg.split(', ')[:-1]) + ' and ' + errorMsg.split(', ')[-1]
-        raise ImportError(errorMsg)
-
-    from scipy.spatial import Voronoi, Delaunay
-    from pathlib import Path
-    
-    calculator = ChannelCalculator(atoms, r1, r2, min_depth, bottleneck, sparsity)
-    
-    atoms = atoms.select('not hetero')
-    coords = atoms.getCoords()
-    
-    vdw_radii = calculator.get_vdw_radii(atoms.getElements())
-        
-    dela = Delaunay(coords)
-    voro = Voronoi(coords)
-        
-    s_prt = State(dela.simplices, dela.neighbors, voro.vertices)
-    s_tmp = State(*s_prt.get_state())
-    s_prv = State(None, None, None) 
-        
-    while True:
-        s_prv.set_state(*s_tmp.get_state())
-        s_tmp.set_state(*calculator.delete_simplices3d(coords, *s_tmp.get_state(), vdw_radii, r1, True))
-        if s_tmp == s_prv:
-            break
-        
-    s_srf = State(*s_tmp.get_state())
-    s_inr = State(*calculator.delete_simplices3d(coords, *s_srf.get_state(), vdw_radii, r2, False))
-        
-    l_first_layer_simp, l_second_layer_simp = calculator.surface_layer(s_srf.simp, s_inr.simp, s_srf.neigh)
-    s_clr = State(*calculator.delete_section(l_first_layer_simp, *s_inr.get_state()))
-        
-    c_cavities = calculator.find_groups(s_clr.neigh)
-    c_surface_cavities = calculator.get_surface_cavities(c_cavities, s_clr.simp, l_second_layer_simp, s_clr, coords, vdw_radii, sparsity)
-        
-    calculator.find_deepest_tetrahedra(c_surface_cavities, s_clr.neigh)
-    c_filtered_cavities = calculator.filter_cavities(c_surface_cavities, min_depth)
-    merged_cavities = calculator.merge_cavities(c_filtered_cavities, s_clr.simp)
-        
-    for cavity in c_filtered_cavities:
-        calculator.dijkstra(cavity, *s_clr.get_state(), coords, vdw_radii)
-        
-    calculator.filter_channels_by_bottleneck(c_filtered_cavities, bottleneck)
-    channels = [channel for cavity in c_filtered_cavities for channel in cavity.channels]
-        
-    no_of_channels = len(channels)
-    LOGGER.info("Detected " + str(no_of_channels) + " channels.")
-        
-    if output_path:
-        output_path = Path(output_path)
-        
-        if output_path.is_dir():
-            output_path = output_path / "output.pdb"
-        elif not output_path.suffix == ".pdb":
-            output_path = output_path.with_suffix(".pdb")
-    
-        if not separate:
-            LOGGER.info("Saving results to " + str(output_path) + ".")
-        else:
-            LOGGER.info("Saving multiple results to directory " + str(output_path.parent) + ".")
-        calculator.save_channels_to_pdb(c_filtered_cavities, output_path, separate)
-    else:
-        LOGGER.info("No output path given.")
-                
-    return channels, [coords, s_srf.simp, merged_cavities, s_clr.simp]
-            
-def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None, separate=False, **kwargs):
-    """
-    Compute channels for each frame in a given trajectory or multi-model PDB file.
-
-    This function calculates the channels for each frame in a trajectory or for each model
-    in a multi-model PDB file. The `kwargs` can include parameters necessary for channel calculation.
-    If the `separate` parameter is set to True, each detected channel will be saved in a separate PDB file.
-
-    :param atoms: Atomic data or object containing atomic coordinates and methods for accessing them.
-    :type atoms: object
-
-    :param trajectory: Trajectory object containing multiple frames or a multi-model PDB file.
-    :type trajectory: Atomic or Ensemble object
-
-    :param output_path: Optional path to save the resulting channels and associated data in PDB format.
-        If a directory is specified, each frame/model will have its results saved in separate files. 
-        If None, results are not saved. Default is None.
-    :type output_path: str or None
-
-    :param separate: If True, each detected channel is saved to a separate PDB file for each frame/model.
-        If False, all channels for each frame/model are saved in a single file. Default is False.
-    :type separate: bool
-
-    :param kwargs: Additional parameters required for channel calculation. This can include parameters such as
-        radius values, minimum depth, bottleneck values, etc.
-    :type kwargs: dict
-
-    :returns: List of channels and surfaces computed for each frame or model. Each entry in the list corresponds
-        to a specific frame or model.
-    :rtype: list of lists
-
-    Example usage:
-    channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, output_path="channels.pdb", separate=False, r1=3, r2=1.25, min_depth=10, bottleneck=1, sparsity=15)
-    """
-    
-    if not checkAndImport('pathlib'):
-        errorMsg = 'To run showChannels, please install open3d.'
-        raise ImportError(errorMsg)
-            
-    from pathlib import Path
-    
-    try:
-        coords = getCoords(atoms)
-    except AttributeError:
-        try:
-            checkCoords(coords)
-        except TypeError:
-            raise TypeError('coords must be an object with `getCoords` method')    
-
-    channels_all = []
-    surfaces_all = []
-    start_frame = kwargs.pop('start_frame', 0)
-    stop_frame = kwargs.pop('stop_frame', -1)
-    
-    if output_path:
-        output_path = Path(output_path)
-        if output_path.suffix == ".pdb":
-            output_path = output_path.with_suffix('')
-
-    if trajectory is not None:
-        if isinstance(trajectory, Atomic):
-            trajectory = Ensemble(trajectory)
-
-        nfi = trajectory._nfi
-        trajectory.reset()
-
-        if stop_frame == -1:
-            traj = trajectory[start_frame:]
-        else:
-            traj = trajectory[start_frame:stop_frame+1]
-
-        atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=start_frame):
-            LOGGER.info('Frame: {0}'.format(j0))
-            atoms_copy.setCoords(frame0.getCoords())
-            if output_path:
-                channels, surfaces = calcChannels(atoms_copy, str(output_path) + "{0}.pdb".format(j0), separate, **kwargs)
-            else:
-                channels, surfaces = calcChannels(atoms_copy, **kwargs)
-            channels_all.append(channels)
-            surfaces_all.append(surfaces)
-        trajectory._nfi = nfi
-
-    else:
-        if atoms.numCoordsets() > 1:
-            for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
-                LOGGER.info('Model: {0}'.format(i+start_frame))
-                atoms.setACSIndex(i+start_frame)
-                if output_path:
-                    channels, surfaces = calcChannels(atoms, str(output_path) + "{0}.pdb".format(i+start_frame), separate, **kwargs)
-                else:
-                    channels, surfaces = calcChannels(atoms, **kwargs)
-                channels_all.append(channels)
-                surfaces_all.append(surfaces)
-        else:
-            LOGGER.info('Include trajectory or use multi-model PDB file.')
-
-    return channels_all, surfaces_all
-
-def getChannelParameters(channels):
-    """
-    Extracts and returns the lengths, bottlenecks, and volumes of each channel in a given list of channels.
-
-    This function iterates through a list of channel objects, extracting the length, bottleneck, 
-    and volume of each channel. These values are collected into separate lists, which are returned 
-    as a tuple for further use.
-
-    :arg channels: A list of channel objects, where each channel has attributes `length`, `bottleneck`, 
-        and `volume`. These attributes represent the length of the channel, the minimum radius 
-        (bottleneck) along its path, and the total volume of the channel, respectively.
-    :type channels: list
-
-    :returns: Three lists containing the lengths, bottlenecks, and volumes of the channels.
-    :rtype: tuple (list, list, list)
-
-    Example usage:
-    lengths, bottlenecks, volumes = getChannelParameters(channels)
-    """
-    
-    lengths = []
-    bottlenecks = []
-    volumes = []
-    for channel in channels:
-        lengths.append(channel.length)
-        bottlenecks.append(channel.bottleneck)
-        volumes.append(channel.volume)
-        
-    return lengths, bottlenecks, volumes
-
-def getChannelAtoms(channels, protein=None, num_samples=5):
-    """
-    Generates an AtomGroup object representing the atoms along the paths of the given channels
-    and optionally combines them with an existing protein structure.
-
-    This function takes a list of channel objects and generates atomic representations of the
-    channels based on their centerline splines and radius splines. The function samples points
-    along each channel's centerline and assigns atom positions at these points with corresponding
-    radii, creating a list of PDB-formatted lines. These lines are then converted into an AtomGroup
-    object using the ProDy library. If a protein structure is provided, it is combined with the
-    generated channel atoms by merging their respective PDB streams.
-
-    :param channels: A list of channel objects. Each channel has a method `get_splines()` that
-        returns the centerline spline and radius spline of the channel.
-    :type channels: list
-
-    :param protein: An optional AtomGroup object representing a protein structure. If provided, 
-        it will be combined with the generated channel atoms.
-    :type protein: prody.atomic.AtomGroup or None
-
-    :param num_samples: The number of atom samples to generate along each segment of the channel.
-        More samples result in a finer representation of the channel. Default is 5.
-    :type num_samples: int
-
-    :returns: An AtomGroup object representing the combined atoms of the channels and the protein,
-        if a protein is provided.
-    :rtype: prody.atomic.AtomGroup
-
-    Example usage:
-    atomic_structure = getChannelAtoms(channels, protein)
-    """
-    import io
-    from prody import parsePDBStream, writePDBStream
-
-    def convert_lines_to_atomic(atom_lines):
-        pdb_text = "\n".join(atom_lines)
-        pdb_stream = io.StringIO(pdb_text)
-        structure = parsePDBStream(pdb_stream)
-        return structure
-
-    atom_index = 1
-    pdb_lines = []
-
-    if not isinstance(channels, list):
-        channels = [channels]
-    
-    for channel in channels:
-        centerline_spline, radius_spline = channel.get_splines()
-        samples = len(channel.tetrahedra) * num_samples
-        t = np.linspace(centerline_spline.x[0], centerline_spline.x[-1], samples)
-        centers = centerline_spline(t)
-        radii = radius_spline(t)
-
-        for i, (x, y, z, radius) in enumerate(zip(centers[:, 0], centers[:, 1], centers[:, 2], radii), start=atom_index):
-            pdb_lines.append("ATOM  %5d  H   FIL T   1    %8.3f%8.3f%8.3f  1.00  %6.2f\n" % (i, x, y, z, radius))
-    
-    if protein is not None:
-        protein_stream = io.StringIO()
-        writePDBStream(protein_stream, protein)
-        
-        protein_stream.seek(0)
-
-        protein_lines = protein_stream.readlines()
-        if protein_lines[-1].strip() == 'END':
-            protein_lines = protein_lines[:-1]
-        
-        combined_pdb_text = "".join(protein_lines) + "\n".join(pdb_lines) + "\nEND\n"
-        combined_stream = io.StringIO(combined_pdb_text)
-        combined_structure = parsePDBStream(combined_stream)
-
-        return combined_structure
-
-    channels_atomic = convert_lines_to_atomic(pdb_lines)
-    return channels_atomic
-    
-class Channel:
-    def __init__(self, tetrahedra, centerline_spline, radius_spline, length, bottleneck, volume):
-        self.tetrahedra = tetrahedra
-        self.centerline_spline = centerline_spline
-        self.radius_spline = radius_spline
-        self.length = length
-        self.bottleneck = bottleneck
-        self.volume = volume
-            
-    def get_splines(self):
-        return self.centerline_spline, self.radius_spline
-    
-class State:
-    def __init__(self, simplices, neighbors, vertices):
-        self.simp = simplices
-        self.neigh = neighbors
-        self.verti = vertices
-        
-    def __eq__(self, other):
-        if not isinstance(other, State):
-            return False
-        return (np.array_equal(self.simp, other.simp) and
-                np.array_equal(self.neigh, other.neigh) and
-                np.array_equal(self.verti, other.verti))
-        
-    def set_state(self, simplices, neighbors, vertices):
-        self.simp = simplices
-        self.neigh = neighbors
-        self.verti = vertices
-        
-    def get_state(self):
-        return self.simp, self.neigh, self.verti
-
-class Cavity:
-    def __init__(self, tetrahedra, is_connected_to_surface):
-        self.tetrahedra = tetrahedra
-        self.is_connected_to_surface = is_connected_to_surface
-        self.starting_tetrahedron = None
-        self.channels = []
-        self.depth = 0
-        
-    def make_surface(self):
-        self.is_connected_to_surface = True
-        
-    def set_exit_tetrahedra(self, exit_tetrahedra, end_tetrahedra):
-        self.exit_tetrahedra = exit_tetrahedra
-        self.end_tetrahedra = end_tetrahedra
-        
-    def set_starting_tetrahedron(self, tetrahedron):
-        self.starting_tetrahedron = tetrahedron
-        
-    def set_depth(self, depth):
-        self.depth = depth
-        
-    def add_channel(self, channel):
-        self.channels.append(channel)
-        
-class ChannelCalculator:
-    def __init__(self, atoms, r1=3, r2=1.25, min_depth=10, bottleneck=1, sparsity=15):
-        self.atoms = atoms
-        self.r1 = r1
-        self.r2 = r2
-        self.min_depth = min_depth
-        self.bottleneck = bottleneck
-        self.sparsity = sparsity
-        
-    def sphere_fit(self, vertices, tetrahedron, vertice, vdw_radii, r):
-        center = vertice
-        d_sum = sum(np.linalg.norm(center - vertices[atom]) for atom in tetrahedron)
-        r_sum = sum(r + vdw_radii[atom] for atom in tetrahedron)
-        
-        return d_sum >= r_sum
-
-    def delete_simplices3d(self, points, simplices, neighbors, vertices, vdw_radii, r, surface):
-        simp, neigh, verti, deleted = [], [], [], []
-        
-        for i, tetrahedron in enumerate(simplices):
-            should_delete = (-1 in neighbors[i] and self.sphere_fit(points, tetrahedron, vertices[i], vdw_radii, r)) if surface else not self.sphere_fit(points, tetrahedron, vertices[i], vdw_radii, r)
-            
-            if should_delete:
-                deleted.append(i)
-            else:
-                simp.append(simplices[i])
-                neigh.append(neighbors[i])
-                verti.append(vertices[i])
-        
-        simp = np.array(simp)
-        neigh = np.array(neigh)
-        verti = np.array(verti)
-        deleted = np.array(deleted)
-        
-        mask = np.isin(neigh, deleted)
-        neigh[mask] = -1
-        
-        for i in reversed(deleted):
-            mask = (neigh > i) & (neigh != -1)
-            neigh[mask] -= 1
-        
-        return simp, neigh, verti
-
-    def delete_section(self, simplices_subset, simplices, neighbors, vertices, reverse=False):
-        simp, neigh, verti, deleted = [], [], [], []
-      
-        for i, tetrahedron in enumerate(simplices): 
-            match = any((simplices_subset == tetrahedron).all(axis=1))
-            if reverse:
-                if match:
-                    simp.append(tetrahedron)
-                    neigh.append(neighbors[i])
-                    verti.append(vertices[i])
-                else:
-                    deleted.append(i)
-            else:
-                if match:
-                    deleted.append(i)
-                else:
-                    simp.append(tetrahedron)
-                    neigh.append(neighbors[i])
-                    verti.append(vertices[i])
-
-        simp, neigh, verti = map(np.array, [simp, neigh, verti])
-        deleted = np.array(deleted)
-        
-        mask = np.isin(neigh, deleted)
-        neigh[mask] = -1
-        
-        for i in reversed(deleted):
-            neigh = np.where((neigh > i) & (neigh != -1), neigh - 1, neigh)
-        
-        return simp, neigh, verti
-
-    def get_vdw_radii(self, atoms):
-        vdw_radii_dict = {
-            'H': 1.20, 'HE': 1.40, 'LI': 1.82, 'BE': 1.53, 'B': 1.92, 'C': 1.70,
-            'N': 1.55, 'O': 1.52, 'F': 1.47, 'NE': 1.54, 'NA': 2.27, 'MG': 1.73,
-            'AL': 1.84, 'SI': 2.10, 'P': 1.80, 'S': 1.80, 'CL': 1.75, 'AR': 1.88,
-            'K': 2.75, 'CA': 2.31, 'SC': 2.11, 'NI': 1.63, 'CU': 1.40, 'ZN': 1.39,
-            'GA': 1.87, 'GE': 2.11, 'AS': 1.85, 'SE': 1.90, 'BR': 1.85, 'KR': 2.02,
-            'RB': 3.03, 'SR': 2.49, 'PD': 1.63, 'AG': 1.72, 'CD': 1.58, 'IN': 1.93,
-            'SN': 2.17, 'SB': 2.06, 'TE': 2.06, 'I': 1.98, 'XE': 2.16, 'CS': 3.43,
-            'BA': 2.68, 'PT': 1.75, 'AU': 1.66, 'HG': 1.55, 'TL': 1.96, 'PB': 2.02,
-            'BI': 2.07, 'PO': 1.97, 'AT': 2.02, 'RN': 2.20, 'FR': 3.48, 'RA': 2.83,
-            'U': 1.86, 'FE': 2.44
-        }
-        
-        return np.array([vdw_radii_dict[atom] for atom in atoms])
-
-    def surface_layer(self, shape_simplices, filtered_simplices, shape_neighbors):
-        surface_simplices, surface_neighbors = [], []
-        interior_simplices = []
-        
-        for i in range(len(shape_simplices)): 
-            if -1 in shape_neighbors[i]:
-                surface_simplices.append(shape_simplices[i])
-                surface_neighbors.append(shape_neighbors[i])
-            else:
-                interior_simplices.append(shape_simplices[i])
-        
-        surface_simplices = np.array(surface_simplices)
-        surface_neighbors = np.array(surface_neighbors)
-        interior_simplices = np.array(interior_simplices)
-        
-        filtered_surface_simplices = surface_simplices[
-            np.any(np.all(surface_simplices[:, None] == filtered_simplices, axis=2), axis=1)
-        ]
-        filtered_surface_neighbors = surface_neighbors[
-            np.any(np.all(surface_simplices[:, None] == filtered_simplices, axis=2), axis=1)
-        ]
-        
-        filtered_surface_neighbors = np.unique(filtered_surface_neighbors)
-        filtered_surface_neighbors = filtered_surface_neighbors[filtered_surface_neighbors != 0]
-        
-        filtered_interior_simplices = interior_simplices[
-            np.any(np.all(interior_simplices[:, None] == filtered_simplices, axis=2), axis=1)
-        ]
-
-        surface_layer_neighbor_simplices = shape_simplices[filtered_surface_neighbors]
-        
-        second_layer = filtered_interior_simplices[
-            np.any(np.all(filtered_interior_simplices[:, None] == surface_layer_neighbor_simplices, axis=2), axis=1)
-        ]
-
-        return filtered_surface_simplices, second_layer
-
-            
-    def find_groups(self, neigh, is_cavity=True):
-        x = neigh.shape[0]
-        visited = np.zeros(x, dtype=bool)
-        groups = []
-
-        def dfs(tetra_index):
-            stack = [tetra_index]
-            current_group = []
-            while stack:
-                index = stack.pop()
-                if not visited[index]:
-                    visited[index] = True
-                    current_group.append(index)
-                    stack.extend(neighbor for neighbor in neigh[index] if neighbor != -1 and not visited[neighbor])
-            return np.array(current_group)
-
-        for i in range(x):
-            if not visited[i]:
-                current_group = dfs(i)
-                if is_cavity:
-                    groups.append(Cavity(current_group, False))
-                else:
-                    groups.append(current_group)
-            
-        return groups
-
-    def get_surface_cavities(self, cavities, interior_simplices, second_layer, state, points, vdw_radii, sparsity):
-        surface_cavities = []
-        
-        for cavity in cavities:
-            tetrahedra = cavity.tetrahedra
-            second_layer_mask = np.isin(interior_simplices[tetrahedra], second_layer).all(axis=1)
-            
-            if np.any(second_layer_mask):
-                cavity.make_surface()
-                exit_tetrahedra = tetrahedra[second_layer_mask]
-                end_tetrahedra = self.get_end_tetrahedra(exit_tetrahedra, state.verti, points, vdw_radii, state.simp, sparsity)
-                cavity.set_exit_tetrahedra(exit_tetrahedra, end_tetrahedra)
-                surface_cavities.append(cavity)
-                
-        return surface_cavities
-
-
-    def merge_cavities(self, cavities, simplices):
-        merged_tetrahedra = np.concatenate([cavity.tetrahedra for cavity in cavities])
-        return simplices[merged_tetrahedra]
-
-    def find_deepest_tetrahedra(self, cavities, neighbors):
-        from collections import deque
-        
-        for cavity in cavities:
-            exit_tetrahedra = cavity.exit_tetrahedra
-            visited = np.zeros(neighbors.shape[0], dtype=bool)
-            visited[exit_tetrahedra] = True
-            queue = deque([(tetra, 0) for tetra in exit_tetrahedra])
-            max_depth = -1
-            deepest_tetrahedron = None
-
-            while queue:
-                current, depth = queue.popleft()
-                if depth > max_depth:
-                    max_depth = depth
-                    deepest_tetrahedron = current
-
-                for neighbor in neighbors[current]:
-                    if neighbor != -1 and not visited[neighbor] and neighbor in cavity.tetrahedra:
-                        visited[neighbor] = True
-                        queue.append((neighbor, depth + 1))
-
-            cavity.set_starting_tetrahedron(np.array([deepest_tetrahedron]))
-            cavity.set_depth(max_depth)
-            
-    def dijkstra(self, cavity, simplices, neighbors, vertices, points, vdw_radii):
-        import heapq
-        
-        def calculate_weight(current_tetra, neighbor_tetra):
-            current_vertex = vertices[current_tetra]
-            neighbor_vertex = vertices[neighbor_tetra]
-            l = np.linalg.norm(current_vertex - neighbor_vertex)
-            
-            d = np.inf
-            for atom, radius in zip(points[simplices[neighbor_tetra]], vdw_radii[simplices[neighbor_tetra]]):
-                dist = np.linalg.norm(neighbor_vertex - atom) - radius
-                if dist < d:
-                    d = dist
-            
-            b = 1e-3
-            return l / (d**2 + b)
-        
-        def dijkstra_algorithm(start, goal, tetrahedra_set):
-            pq = [(0, start)]
-            distances = {start: 0}
-            previous = {start: None}
-
-            while pq:
-                current_distance, current_tetra = heapq.heappop(pq)
-                
-                if current_tetra == goal:
-                    path = []
-                    while current_tetra is not None:
-                        path.append(current_tetra)
-                        current_tetra = previous[current_tetra]
-                    return path[::-1]
-                
-                if current_distance > distances[current_tetra]:
-                    continue
-                
-                for neighbor in neighbors[current_tetra]:
-                    if neighbor in tetrahedra_set:
-                        weight = calculate_weight(current_tetra, neighbor)
-                        distance = current_distance + weight
-                        if distance < distances.get(neighbor, float('inf')):
-                            distances[neighbor] = distance
-                            previous[neighbor] = current_tetra
-                            heapq.heappush(pq, (distance, neighbor))
-            
-            return None
-
-        tetrahedra_set = set(cavity.tetrahedra)
-        for exit_tetrahedron in cavity.end_tetrahedra:
-            for starting_tetrahedron in cavity.starting_tetrahedron:
-                if exit_tetrahedron != starting_tetrahedron:
-                    path = dijkstra_algorithm(starting_tetrahedron, exit_tetrahedron, tetrahedra_set)
-                    if path:
-                        path_tetrahedra = np.array(path)
-                        channel = Channel(path_tetrahedra, *self.process_channel(path_tetrahedra, vertices, points, vdw_radii, simplices))
-                        cavity.add_channel(channel)
-
-    def calculate_max_radius(self, vertice, points, vdw_radii, simp):
-        atom_positions = points[simp]
-        radii = vdw_radii[simp]
-        distances = np.linalg.norm(atom_positions - vertice, axis=1) - radii
-        return np.min(distances)
-
-    def calculate_radius_spline(self, tetrahedra, voronoi_vertices, points, vdw_radii, simp):
-        vertices = voronoi_vertices[tetrahedra]
-        radii = np.array([self.calculate_max_radius(v, points, vdw_radii, s) for v, s in zip(vertices, simp[tetrahedra])])
-        return radii, np.min(radii)
-
-    def process_channel(self, tetrahedra, voronoi_vertices, points, vdw_radii, simp):
-        from scipy.interpolate import CubicSpline
-        
-        centers = voronoi_vertices[tetrahedra]
-        radii, bottleneck = self.calculate_radius_spline(tetrahedra, voronoi_vertices, points, vdw_radii, simp)
-        
-        t = np.arange(len(centers))
-        centerline_spline = CubicSpline(t, centers, bc_type='natural')
-        radius_spline = CubicSpline(t, radii, bc_type='natural')
-        
-        length = self.calculate_channel_length(centerline_spline)
-        volume = self.calculate_channel_volume(centerline_spline, radius_spline)
-        
-        return centerline_spline, radius_spline, length, bottleneck, volume
-
-    def find_biggest_tetrahedron(self, tetrahedra, voronoi_vertices, points, vdw_radii, simp):
-        radii = np.array([self.calculate_max_radius(voronoi_vertices[tetra], points, vdw_radii, simp[tetra]) for tetra in tetrahedra])
-        max_radius_index = np.argmax(radii)
-        return tetrahedra[max_radius_index]
-
-    def get_end_tetrahedra(self, tetrahedra, voronoi_vertices, points, vdw_radii, simp, sparsity):
-        end_tetrahedra = []
-        current_tetrahedron = self.find_biggest_tetrahedron(tetrahedra, voronoi_vertices, points, vdw_radii, simp)
-        end_tetrahedra.append(current_tetrahedron)
-        end_tetrahedra_set = {current_tetrahedron}
-        
-        while True:
-            found_tetrahedra = []
-            for tetra in tetrahedra:
-                if tetra in end_tetrahedra_set:
-                    continue
-
-                all_far_enough = True  
-                for selected_tetra in end_tetrahedra:
-                    distance = np.linalg.norm(voronoi_vertices[selected_tetra] - voronoi_vertices[tetra])
-                    if distance < sparsity:
-                        all_far_enough = False
-                        break
-                
-                if all_far_enough:
-                    found_tetrahedra.append(tetra)
-
-            if not found_tetrahedra:
-                break
-            
-            biggest_tetrahedron = self.find_biggest_tetrahedron(found_tetrahedra, voronoi_vertices, points, vdw_radii, simp)
-            end_tetrahedra.append(biggest_tetrahedron)
-            end_tetrahedra_set.add(biggest_tetrahedron)
-
-        return np.array(end_tetrahedra)
-
-    def filter_cavities(self, cavities, min_depth):
-        return [cavity for cavity in cavities if cavity.depth >= min_depth]
-
-    def filter_channels_by_bottleneck(self, cavities, bottleneck):
-        for cavity in cavities:
-            cavity.channels = [channel for channel in cavity.channels if channel.bottleneck >= bottleneck]
-
-    def save_channels_to_pdb(self, cavities, filename, separate=False, num_samples=5):
-        filename = str(filename)
-        
-        if separate:
-            channel_index = 0
-            for cavity in cavities:
-                for channel in cavity.channels:
-                    channel_filename = filename.replace('.pdb', '_channel{0}.pdb'.format(channel_index))
-                    
-                    with open(channel_filename, 'w') as pdb_file:
-                        atom_index = 1
-                        centerline_spline, radius_spline = channel.get_splines()
-                        samples = len(channel.tetrahedra) * num_samples
-                        t = np.linspace(centerline_spline.x[0], centerline_spline.x[-1], samples)
-                        centers = centerline_spline(t)
-                        radii = radius_spline(t)
-    
-                        pdb_lines = []
-                        for i, (x, y, z, radius) in enumerate(zip(centers[:, 0], centers[:, 1], centers[:, 2], radii), start=atom_index):
-                            pdb_lines.append("ATOM  %5d  H   FIL T   1    %8.3f%8.3f%8.3f  1.00  %6.2f\n" % (i, x, y, z, radius))
-    
-                        for i in range(1, samples):
-                            pdb_lines.append("CONECT%5d%5d\n" % (i, i + 1))
-                            
-                        pdb_file.writelines(pdb_lines)
-                        
-                    channel_index += 1
-        else:
-            with open(filename, 'w') as pdb_file:
-                atom_index = 1
-                for cavity in cavities:
-                    for channel in cavity.channels:
-                        centerline_spline, radius_spline = channel.get_splines()
-                        samples = len(channel.tetrahedra) * num_samples
-                        t = np.linspace(centerline_spline.x[0], centerline_spline.x[-1], samples)
-                        centers = centerline_spline(t)
-                        radii = radius_spline(t)
-    
-                        pdb_lines = []
-                        for i, (x, y, z, radius) in enumerate(zip(centers[:, 0], centers[:, 1], centers[:, 2], radii), start=atom_index):
-                            pdb_lines.append("ATOM  %5d  H   FIL T   1    %8.3f%8.3f%8.3f  1.00  %6.2f\n" % (i, x, y, z, radius))
-    
-                        for i in range(1, samples):
-                            pdb_lines.append("CONECT%5d%5d\n" % (i, i + 1))
-                            
-                        pdb_file.writelines(pdb_lines)
-                        pdb_file.write("\n")
-                        atom_index += samples
-
-
-    def calculate_channel_length(self, centerline_spline):
-        t_values = np.linspace(centerline_spline.x[0], centerline_spline.x[-1], len(centerline_spline.x) * 10)
-        points = centerline_spline(t_values)
-        diffs = np.diff(points, axis=0)
-        lengths = np.linalg.norm(diffs, axis=1)
-        return np.sum(lengths)
-    
-    def calculate_channel_volume(self, centerline_spline, radius_spline):
-        import warnings
-        from scipy.integrate import quad, IntegrationWarning  
-        
-        warnings.filterwarnings("ignore", category=IntegrationWarning)
-        
-        t_min = centerline_spline.x[0]
-        t_max = centerline_spline.x[-1]
-    
-        def differential_volume(t):
-            r = radius_spline(t)
-            area = np.pi * r**2
-            dx_dt = centerline_spline(t, 1)
-            centerline_derivative = np.linalg.norm(dx_dt)
-            return area * centerline_derivative
-        
-        volume, error = quad(differential_volume, t_min, t_max)
-        
-        r_start = radius_spline(t_min)
-        r_end = radius_spline(t_max)
-        
-        hemisphere_volume_start = (2/3) * np.pi * r_start**3
-        hemisphere_volume_end = (2/3) * np.pi * r_end**3
-        
-        total_volume = volume + hemisphere_volume_start + hemisphere_volume_end
-        
-        return total_volume
-            
-    
-
-
 
