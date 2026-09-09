@@ -4,15 +4,15 @@ models and/or header sections are removed for having a compact installation
 package that contains test modules and files as well."""
 
 
-from os.path import join, isfile, split, splitext
+from os.path import join, isfile, splitext
 from prody.tests import TestCase
 
 from numpy import array
 import numpy as np
 
 from prody import parsePDB, parseDCD, parseMMCIF, parseMMTF
-from prody import parseSparseMatrix, parseArray, loadModel
-from prody.tests import TEMPDIR, TESTDIR
+from prody import parseSparseMatrix, parseArray, parseTree, loadModel
+from prody.tests import TEMPDIR, TESTDIR # here for others to import
 
 
 DATA_FILES = {
@@ -248,11 +248,42 @@ DATA_FILES = {
         'models': 1,
         'unobs_B_start': 'G-------------------------------NQNTTEK-'
     },
+    'pymol_cif': {
+        'pdb': '3o21',
+        'file': 'mmcif_3o21_pymol.cif',
+        'atoms': 12793,
+        'last_coords': array([50.327, -11.971, -19.976])
+    },
+    'scipion_cif': {
+        'pdb': '4ake',
+        'file': 'mmcif_4ake_scipion.cif',
+        'atoms': 3459,
+        'last_coords': array([ 1.413, -6.322, -9.968])
+    },
+    'big_biomols_cif': {
+        'pdb': '7cth',
+        'file': 'mmcif_7cth.cif',
+        'atoms': 16647,
+        'bm0_atoms': 16647 * 60,
+        'num_chains': 14,
+        'bm0_chains': 840,
+    },
+    'boltz_wrapped_line_cif':{
+        'file': 'NRAS_BRAF_GDP_model_0.cif',
+        'atoms': 7333,
+        'num_chains': 3
+    },
     'long_chid_cif': {
         'pdb': '6zu5',
         'file': 'mmcif_6zu5.cif',
         'atoms': 165175,
         'segment_SX0_atoms': 1089,
+    },
+    'chimerax_cif': {
+        'pdb': '1ake',
+        'file': 'mmcif_1ake_chimerax.cif',
+        'biomols': 2,
+        'bm0_atoms': 1954
     },
     '6zu5_sel': {
         'pdb': '6zu5',
@@ -337,6 +368,12 @@ DATA_FILES = {
     },    
     '2k39_insty': {
         'file': '2k39_insty.pdb'
+    },    
+    '2k39_insty_first': {
+        'file': '2k39_insty_first.pdb'
+    },    
+    '2k39_insty_dcd': {
+        'file': '2k39_insty.dcd'
     },
     '2k39_hbs': {
         'file': '2k39_hbs.npy'
@@ -358,7 +395,10 @@ DATA_FILES = {
     },
     '2k39_disu': {
         'file': '2k39_disu.npy'
-    },    
+    },
+    '3o21_disu': {
+        'file': '3o21_disu.npy'
+    },
     '2k39_all': {
         'file': '2k39_all.npy'
     },
@@ -401,6 +441,34 @@ DATA_FILES = {
         'file': 'pqr_snippet4_pymol.pqr',
         'atoms': 5,
         'models': 1
+    },
+    'anmd': {
+        'pdb': '1ubi',
+        'file': '1ubi_anmd_mode1_ens.pdb',
+        'n_atoms': 683,
+        'models': 5
+    },
+    'probes': {
+        'file': 'probes_in.pdb',
+        'n_atoms': 4,
+        'long_resname': 'ACET',
+        'short_resname': 'ACE'
+    },
+    'upgma_tree': {
+        'file': 'simple_tree_upgma.nwk',
+        'n_leaves': 4,
+        'n_top_clades': 2,
+    },
+    'nj_tree': {
+        'file': 'simple_tree_nj.nwk',
+        'n_leaves': 4,
+        'n_top_clades': 3,
+    },
+    'modres_ncaa': {
+        'file': 'pdb_modres_ncaa.pdb'
+    },
+    'sep_modres': {
+        'file': 'pdb5fc2_sep_modres.pdb'
     }
 }
 
@@ -411,7 +479,8 @@ PARSERS = {
     '.coo': parseSparseMatrix, '.dat': parseArray,
     '.txt': np.loadtxt,
     '.npy': lambda fn, **kwargs: np.load(fn, allow_pickle=True),
-    '.gz': lambda fn, **kwargs: PARSERS[splitext(fn)[1]](fn, **kwargs)
+    '.gz': lambda fn, **kwargs: PARSERS[splitext(fn)[1]](fn, **kwargs),
+    '.nwk': parseTree
 }
 
 

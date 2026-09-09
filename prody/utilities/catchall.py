@@ -8,11 +8,13 @@ from .checkers import checkCoords
 from .logger import LOGGER
 
 
-__all__ = ['calcTree', 'clusterMatrix', 'showLines', 'showMatrix', 
+__all__ = ['calcTree', 'writeTree', 'parseTree',
+           'clusterMatrix',
+           'showLines', 'showMatrix', 'showBars', 'showHistogram', 
            'reorderMatrix', 'findSubgroups', 'getCoords',  
            'getLinkage', 'getTreeFromLinkage', 'clusterSubfamilies', 
-           'calcRMSDclusters', 'calcGromosClusters', 'calcGromacsClusters',
-           'calcKmedoidClusters']
+           'calcRMSDclusters', 'calcGromosClusters', 'calcGromacsClusters', 
+           'printAtomicMatrix', 'calcKmedoidClusters']
 
 class LinkageError(Exception):
     pass
@@ -238,7 +240,7 @@ def getTreeFromLinkage(names, linkage):
     :arg linkage: linkage matrix
     :type linkage: :class:`~numpy.ndarray`
     """
-    try: 
+    try:
         from Bio.Phylo.BaseTree import Tree, Clade
     except ImportError:
         raise ImportError('Phylo module could not be imported. '
@@ -307,14 +309,15 @@ def calcTree(names, distance_matrix, method='upgma', linkage=False):
     :type linkage: bool
     """
             
-    from .TreeConstruction import DistanceMatrix, DistanceTreeConstructor
+    from .TreeConstruction import DistanceTreeConstructor
+    from Bio.Phylo.TreeConstruction import _DistanceMatrix as DistanceMatrix
     
     if len(names) != distance_matrix.shape[0] or len(names) != distance_matrix.shape[1]:
         raise ValueError("Mismatch between the sizes of matrix and names.")
     
     method = method.lower().strip()
 
-    if method in ['ward', 'single', 'average', 'weighted', 'centroid', 'median']:
+    if method in ['ward', 'single', 'average', 'weighted', 'centroid', 'median', 'complete']:
         from scipy.cluster.hierarchy import linkage as hlinkage
         from scipy.spatial.distance import squareform
         
@@ -365,7 +368,7 @@ def writeTree(filename, tree, format_str='newick'):
     :arg format_str: a string specifying the format for the tree
     :type format_str: str
     """
-    try: 
+    try:
         from Bio import Phylo
     except ImportError:
         raise ImportError('Phylo module could not be imported. '
@@ -383,6 +386,29 @@ def writeTree(filename, tree, format_str='newick'):
 
     Phylo.write(tree, filename, format_str)
 
+def parseTree(filename, format_str='newick'):
+    """ Parse a tree from a file using Biopython.
+
+    :arg filename: name for output file
+    :type filename: str
+
+    :arg format_str: a string specifying the format for the tree
+    :type format_str: str
+    """
+    try:
+        from Bio import Phylo
+    except ImportError:
+        raise ImportError('Phylo module could not be imported. '
+            'Reinstall ProDy or install Biopython '
+            'to solve the problem.')
+
+    if not isinstance(filename, str):
+        raise TypeError('filename should be a string')
+
+    if not isinstance(format_str, str):
+        raise TypeError('format_str should be a string')
+
+    return Phylo.read(filename, format_str)
 
 def clusterMatrix(distance_matrix=None, similarity_matrix=None, labels=None, return_linkage=None, **kwargs):
     """
@@ -390,6 +416,7 @@ def clusterMatrix(distance_matrix=None, similarity_matrix=None, labels=None, ret
     return the sorted matrix, indices used for sorting, sorted labels (if **labels** are passed),  
     and linkage matrix (if **return_linkage** is **True**). 
     
+       
     :arg distance_matrix: an N-by-N matrix containing some measure of distance 
          such as 1. - seqid_matrix (Hamming distance), rmsds, or distances in PCA space
     :type distance_matrix: :class:`~numpy.ndarray`
@@ -412,6 +439,11 @@ def clusterMatrix(distance_matrix=None, similarity_matrix=None, labels=None, ret
 
     Other arguments for :func:`~scipy.hierarchy.linkage` and :func:`~scipy.hierarchy.dendrogram`
     can also be provided and will be taken as **kwargs**.
+    
+    
+    .. seealso::
+        :func:`clusterHierarchical`
+            Hierarchical clustering of a distance matrix using SciPy.
     """
 
     import scipy.cluster.hierarchy as sch
@@ -591,6 +623,73 @@ def showLines(*args, **kwargs):
 
     return lines, polys
 
+def showBars(ydata, xdata=None, *args, **kwargs):
+    """
+    Show 1-D data using :func:`~matplotlib.axes.Axes.bar`. 
+    
+    :arg x: (optional) x coordinates. *x* can be an 1-D array or a 2-D matrix of 
+            column vectors.
+            If not provided, a range with the length of the y data will be used.
+    :type x: :class:`~numpy.ndarray`
+
+    :arg y: data array. *y* can be an 1-D array or a 2-D matrix of 
+            column vectors.
+    :type y: :class:`~numpy.ndarray`
+
+    :arg ticklabels: user-defined tick labels for x-axis.
+    :type ticklabels: list
+    """
+    
+    # note for developers: this function serves as a low-level 
+    # plotting function which provides basic utilities for other 
+    # plotting functions. Therefore showFigure is not handled 
+    # in this function as it should be already handled in the caller.
+
+    ticklabels = kwargs.pop('ticklabels', None)
+    gap = kwargs.pop('gap', False)
+    labels = kwargs.pop('label', None)
+
+    from matplotlib import cm, ticker
+    from matplotlib.pyplot import figure, gca, xlim
+    from .drawtools import IndexFormatter
+
+    if xdata is None:
+        xdata = list(range(len(ydata)))
+
+    ax = gca()
+    bars = ax.bar(xdata, ydata, *args, **kwargs)
+        
+    for i, bar in enumerate(bars):
+        x, y = bar.get_xy()
+        
+        if gap:
+            x_new, y_new = addEnds(x, y)
+            bar.set_data(x_new, y_new)
+        else:
+            x_new, y_new = x, y
+        
+        if labels is not None:
+            if np.isscalar(labels):
+                bar.set_label(labels)
+            else:
+                try:
+                    bar.set_label(labels[i])
+                except IndexError:
+                    raise ValueError('The number of labels ({0}) and that of y ({1}) do not match.'
+                                     .format(len(labels), len(bar)))
+
+    ax.margins(x=0)
+    if ticklabels is not None:
+        if callable(ticklabels):
+            ax.get_xaxis().set_major_formatter(ticker.FuncFormatter(ticklabels))
+        else:
+            ax.get_xaxis().set_major_formatter(IndexFormatter(ticklabels))
+    
+    ax.xaxis.set_major_locator(ticker.AutoLocator())
+    ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+
+    return bars
+
 def showMatrix(matrix, x_array=None, y_array=None, **kwargs):
     """Show a matrix using :meth:`~matplotlib.axes.Axes.imshow` or
     :meth:`~matplotlib.axes.Axes.scatter` if *markersize* is provided.
@@ -609,6 +708,14 @@ def showMatrix(matrix, x_array=None, y_array=None, **kwargs):
     :arg percentile: a percentile threshold to remove outliers, i.e. only showing data within *p*-th 
                      to *100-p*-th percentile
     :type percentile: float
+
+    :arg vmin: a minimum value threshold to remove outliers, i.e. only showing data greater than vmin
+               This overrides percentile.
+    :type vmin: float
+
+    :arg vmax: a maximum value threshold to remove outliers, i.e. only showing data less than vmax
+               This overrides percentile.
+    :type vmax: float
 
     :arg interactive: turn on or off the interactive options
     :type interactive: bool
@@ -671,7 +778,7 @@ def showMatrix(matrix, x_array=None, y_array=None, **kwargs):
     interactive = kwargs.pop('interactive', True)
 
     import matplotlib
-    if float(matplotlib.__version__[:-2]) >= 3.6:
+    if float(matplotlib.__version__.split('.')[0]) >= 3 or float(matplotlib.__version__.split('.')[1]) >= 6:
         LOGGER.warn('matplotlib 3.6 and later are not compatible with interactive matrices')
         interactive = False
 
@@ -990,6 +1097,141 @@ def findSubgroups(tree, c, method='naive', **kwargs):
     return subgroups
 
 
+def getAtomicTable(matrix, atoms_i=None, atoms_j=None, 
+                   fmt='%5d', sep='\t'):
+    """Generates a new table for a matrix with atom labels along 
+    the top and at the beginning of each line for :func:`.printAtomicTable`.
+
+    :arg matrix: any square 2D data with a size matching atoms
+    :type matrix: tuple, list, :class:`~numpy.ndarray`
+
+    :arg atoms_i: any :class:`.Atomic` object to label the rows
+    :type atoms_i: :class:`.Atomic`
+
+    :arg atoms_j: any :class:`.Atomic` object to label the columns
+        uses atoms_i by default
+    :type atoms_j: :class:`.Atomic`
+
+    :arg fmt: format string for formatting numbers
+    :type fmt: str
+    """
+    if not isListLike(matrix):
+        raise TypeError('matrix should be list-like')
+
+    matrix = np.array(matrix)
+    if matrix.ndim != 2:
+        raise ValueError('matrix should be 2-dimensional')
+
+    if atoms_j is None:
+        atoms_j = atoms_i
+
+    if atoms_i is not None and matrix.shape[0] != atoms_i.numAtoms():
+        raise ValueError('number of rows should be number of atoms_i')
+
+    if atoms_j is not None and matrix.shape[1] != atoms_j.numAtoms():
+        raise ValueError('number of cols should be number of atoms_j')
+
+    if not isinstance(fmt, str):
+        raise TypeError('fmt should be a string')
+
+    chars = [list(item) for item in fmt.split('.')]
+    nums = []
+    for item in chars:
+        num_str = ''
+        for char in item:
+            if char.isnumeric():
+                num_str += char
+        nums.append(int(num_str))
+
+    if len(nums) == 1:
+        length = nums[0]
+    else:
+        if nums[0] >= nums[1] + 2:
+            length = nums[0]
+        else:
+            length = nums[1] + 2
+
+    table = ' '*length
+
+    if atoms_i is None and atoms_j is None:
+        resnum_length = len(str(max(matrix.shape)))
+        chid_length = 0
+
+    elif atoms_i is None:
+        resnum_length = len(str(max(atoms_j.getResnums())))
+        chid_length = max([len(chid) for chid in atoms_j.getChids()])
+
+    elif atoms_j is None:
+        resnum_length = len(str(max(atoms_i.getResnums())))
+        chid_length = max([len(chid) for chid in atoms_i.getChids()])
+
+    else:        
+        resnum_length = max(len(str(max(atoms_i.getResnums()))),
+                            len(str(max(atoms_j.getResnums()))))
+        chid_length = max(max([len(chid) for chid in atoms_i.getChids()]),
+                        max([len(chid) for chid in atoms_j.getChids()]))
+    
+    for j in range(matrix.shape[1]):
+        table += sep
+        if length >= resnum_length + chid_length:
+            if atoms_j is None:
+                chid = ''
+            else:
+                chid = atoms_j[j].getChid()
+            table += ' '*(chid_length - len(chid)) + chid
+        if length >= resnum_length + chid_length + 1:
+            table += ' '
+        
+        if atoms_j is not None:
+            if length >= resnum_length + chid_length + 2:
+                table += atoms_j[j].getResname()
+
+            table += '%{0}d'.format(resnum_length) % atoms_j[j].getResnum()
+    table += '\n'
+
+    for i, row in enumerate(matrix):
+        if atoms_i is not None:
+            table += '\t{} {}'.format(atoms_i[i].getChid(),
+                                      atoms_i[i].getResname())
+            table += '%{0}d'.format(resnum_length) % atoms_i[i].getResnum()
+        for element in row:
+            table += fmt % element
+        table += '\n'
+
+    return table
+
+
+def printAtomicMatrix(matrix, atoms=None, step=10, 
+                      fmt='%8d', sep='\t'):
+    """Prints a new table for a matrix with
+    atom labels along the top and at the 
+    beginning of each line.
+
+    :arg matrix: any square 2D data with a size matching atoms
+    :type matrix: tuple, list, :class:`~numpy.ndarray`
+
+    :arg atoms: any :class:`.Atomic` object to label the data
+    :type atoms: :class:`.Atomic`
+    """
+    attempts = len(matrix)//step
+    if len(matrix) > step * attempts:
+        attempts += 1
+    for i in range(attempts):
+        start = step * i
+        stop = step * (i+1)
+        submatrix = matrix[:,start:stop,]
+        if atoms is not None:
+            atoms_i = atoms
+            atoms_j = atoms[start:stop]
+        else:
+            atoms_i = atoms
+            atoms_j = atoms
+        print(getAtomicTable(submatrix, atoms_i, atoms_j,
+                             fmt, sep))
+
+    return
+
+
 def calcRMSDclusters(rmsd_matrix, c, labels=None):
     """
     Divide **rmsd_matrix** into clusters using the gromos method 
@@ -1037,6 +1279,33 @@ calcGromosClusters = calcRMSDclusters
 calcGromacsClusters = calcRMSDclusters
 
 def calcKmedoidClusters(coordsets, nClusters):
+    """
+    Performs K-Medoids clustering directly on coordinate sets using ``scikit-learn-extra``.
+
+    Flattens the input coordinate sets into a 2D matrix and fits a K-Medoids model.
+    Note that this function requires the ``scikit-learn-extra`` package to be installed.
+
+    The returned cluster labels are 0-indexed.
+
+
+    :arg coordsets: coordinate sets of shape ``(n_conformations, n_atoms, 3)`` or any array 
+                    where the first dimension represents individual frames/conformations.
+    :type coordsets: :class:`numpy.ndarray`
+
+    :arg nClusters: prespecified number of clusters to form.
+    :type nClusters: int
+
+    :returns: a tuple of:
+        * a one-dimensional array of shape ``(nClusters,)`` containing the indices of the medoid frames
+        * a one-dimensional array containing the 0-indexed cluster label for each frame
+        * a one-dimensional array containing the number of items in each cluster
+    :rtype: tuple(:class:`numpy.ndarray`, :class:`numpy.ndarray`, :class:`numpy.ndarray`)
+
+
+    .. seealso::
+        :func:`clusterKMedoids`
+            K-Medoids clustering on distance matrices supporting multiple backends and 1-based indexing.
+    """
     try:
         from sklearn_extra.cluster import KMedoids
     except ImportError:
@@ -1047,3 +1316,118 @@ def calcKmedoidClusters(coordsets, nClusters):
     labels = c.labels_
     _, counts = np.unique(labels, return_counts=True)
     return c.medoid_indices_, labels, counts
+
+
+def showHistogram(data, *args, **kwargs):
+    """
+    Plots the distribution of values on the current axis. 
+    The input may be either a one-dimensional array or a symmetric square 2D matrix.
+    
+    Uses Seaborn's :func:`sns.histplot` if available, falling back to 
+    Matplotlib's :meth:`matplotlib.axes.Axes.hist` if Seaborn is not installed.
+    
+    
+    :arg data: 1D array or 2D square symmetric matrix. 
+               If 2D, the upper triangle (excluding diagonal) is automatically extracted.
+    :type data: :class:`numpy.ndarray`
+    
+    :arg *args: positional arguments passed directly to Seaborn's ``histplot`` 
+                or Matplotlib's ``hist`` function.
+    :type *args: tuple
+    
+    :arg title: title of the plot. Default is ``'Distribution'``.
+    :type title: str
+    
+    :arg xlabel: label for the x-axis. Default is ``'Value'``.
+    :type xlabel: str
+    
+    :arg ylabel: label for the y-axis. Default is ``'Frequency'``.
+    :type ylabel: str
+    
+    :arg grid: whether to display horizontal grid lines. Default is ``True``.
+    :type grid: bool
+    
+    :arg ax: axes on which to draw the plot. Default is ``None`` (current axes used).
+    :type ax: :class:`matplotlib.axes.Axes`
+    
+    :arg **kwargs: keyword arguments passed to Seaborn (if installed) or Matplotlib.
+    :type **kwargs: dict
+    
+    :returns: the Matplotlib axes containing the plot.
+    :rtype: :class:`matplotlib.axes.Axes`
+    
+    Example usage:
+    >>> import matplotlib.pyplot as plt
+    >>> distance_matrix = calcPairwiseRMSD(aligned_coords)
+    >>> plt.figure()
+    >>> showHistogram(distance_matrix, xlabel='RMSD [Å]')
+    >>> plt.show() 
+    """
+    
+    import matplotlib.pyplot as plt
+    try:
+        import seaborn as sns
+        has_seaborn = True
+    except ImportError:
+        has_seaborn = False
+
+    data_array = np.asarray(data)
+
+    if data_array.ndim == 2:
+        if data_array.shape[0] != data_array.shape[1]:
+            raise ValueError(f"2D data matrix must be square, but got shape {data_array.shape}")
+        values = data_array[np.triu_indices_from(data_array, k=1)]
+    elif data_array.ndim == 1:
+        values = data_array
+    else:
+        raise ValueError(f"Expected 1D or 2D array, but got shape {data_array.shape}")
+
+    ax = kwargs.pop('ax', None)
+    if ax is None:
+        ax = plt.gca()
+
+    title = kwargs.pop('title', 'Distribution')
+    xlabel = kwargs.pop('xlabel', 'Value')
+    ylabel = kwargs.pop('ylabel', 'Frequency')
+    grid = kwargs.pop('grid', True)
+    label = kwargs.get('label', None)
+
+    if 'lw' in kwargs:
+        kwargs['linewidth'] = kwargs.pop('lw')
+    else:
+        kwargs.setdefault('linewidth', 0.8)
+
+    kwargs.setdefault('bins', 50)
+    kwargs.setdefault('color', 'teal')
+    kwargs.setdefault('alpha', 0.5)
+    kwargs.setdefault('edgecolor', 'black')
+
+    if has_seaborn:
+        kwargs.setdefault('element', 'bars')
+        kwargs.setdefault('stat', 'count')
+        kwargs.setdefault('kde', False)
+
+        sns.histplot(values, *args, ax=ax, **kwargs)
+    else: # matplotlib fallback
+        LOGGER.info("Package 'seaborn' not found; falling back to matplotlib.pyplot.hist().")
+        kde = kwargs.pop('kde', None)
+        kwargs.pop('element', None)
+        kwargs.pop('stat', None)
+        
+        if kde:
+            LOGGER.warning("Kernel density estimation (kde=True) requires 'seaborn' and will be ignored.")
+
+        ax.hist(values, *args, **kwargs)
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if label is not None:
+        ax.legend()
+
+    if grid:
+        ax.grid(axis='y', alpha=0.3)
+
+    return ax
+    
