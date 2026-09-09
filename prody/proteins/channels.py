@@ -18,10 +18,10 @@ from prody.atomic import Atomic
 from prody.utilities import getCoords, isListLike
 from prody.proteins import writePDB, parsePDB, parsePQR
 from prody.ensemble import Ensemble
-from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD, superpose
+from prody.measure import calcCenter
 
 
-__all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
+__all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
            'getChannelParameters', 'getChannelAtoms', 'showChannels', 
            'showCavities', 'showSurfaceCavities', 'selectChannelBySelection', 
            'getChannelResidueNames',
@@ -40,21 +40,6 @@ __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
            'scanSurfaceCavityParameters', 'connectChannelsToSurfaceCavities',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues']
-
-# Sampling of the enclosure test used to strip the moat (see
-# ChannelCalculator.calcEnclosure). These are constants, not knobs: the enclosure
-# of a point depends on how many directions are sampled and how far they are
-# followed, so min_enclosure is only meaningful against a fixed sampling. Adding
-# rays lowers every enclosure, since more directions find more of the thin ways
-# out of a channel, and so invalidates the threshold rather than refining it.
-ENCLOSURE_RAYS = 32
-ENCLOSURE_RANGE = 25.0
-ENCLOSURE_STEP = 0.75
-# One radius for every atom, on the scale of a heavy-atom vdW radius. Enclosure is
-# a burial heuristic, so resolving 1.52 A from 1.7 A would only shift every value
-# by a little and be absorbed by min_enclosure; a single radius means a single
-# tree and a plain nearest-neighbour test.
-ENCLOSURE_RADIUS = 1.7
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -616,7 +601,7 @@ def _saveConnectedCavityChannels(connected, cavity_surface, filename,
         LOGGER.info("Saved {0} individual connected cavity-channel file(s).".format(len(connected)))
 
 
-def _reportAtomsInputComposition(atoms):
+def _reportAtomsInputComposition(atoms, inner_radius=None, diagram=None):
     """Report the composition of atoms supplied for channel analysis.
 
     This function checks whether the input atomic structure contains only
@@ -625,52 +610,169 @@ def _reportAtomsInputComposition(atoms):
     issued indicating that all supplied atoms will be included in the channel
     calculation.
 
+    It also reads how far the structure is protonated, and reports where that
+    sits badly with the run about to be made: a probe smaller than water on a
+    structure missing its hydrogens, hydrogens present but unused because the
+    probe was left at the size an unprotonated structure needs, or a
+    radius-blind diagram on a structure whose radii vary most.
+
     The function does not modify or filter the input structure. To analyze only
     the protein, the user should provide an appropriate ProDy selection, for
-    example ``atoms.select('protein')``. """
-    
+    example ``atoms.select('protein')``.
+
+    :arg inner_radius: probe radius the run will use, if known. Judged against
+        the hydrogen content; omit it to skip that pair of checks.
+    :type inner_radius: float
+
+    :arg diagram: Voronoi diagram the run will use, if known. Omit it to skip
+        the check on radius-blind tessellation.
+    :type diagram: str """
+
     if not isinstance(atoms, Atomic):
         raise TypeError(
             "atoms must be a ProDy Atomic object, such as an AtomGroup "
             "or Selection")
 
     protein = atoms.select('protein')
+    nucleic = atoms.select('nucleic')
     water = atoms.select('water')
     hetero = atoms.select('hetero and not water')
-    other = atoms.select('not protein and not hetero')
-    nonprotein = atoms.select('not protein')
+    other = atoms.select('not protein and not nucleic and not hetero')
+    # Nucleic acid is part of the biomolecule the channels run through, not something
+    # that found its way into the selection, so it is named alongside the protein
+    # rather than counted among the components worth warning about.
+    foreign = atoms.select('not protein and not nucleic')
 
-    if nonprotein is None:
-        LOGGER.info("The atoms supplied to calcChannels contain protein atoms only.")
-        return
+    if foreign is None:
+        LOGGER.info("The atoms supplied to calcChannels contain {0} atoms only.".format(
+            " and ".join(name for name, selection in (('protein', protein),
+                                                      ('nucleic acid', nucleic))
+                         if selection is not None)))
+    else:
+        components = []
 
-    components = []
+        if water is not None:
+            components.append(
+                "water: {0} atoms in {1} residues".format(
+                    water.numAtoms(),
+                    len(np.unique(water.getResindices()))))
 
-    if water is not None:
-        components.append(
-            "water: {0} atoms in {1} residues".format(
-                water.numAtoms(),
-                len(np.unique(water.getResindices()))))
+        if hetero is not None:
+            components.append(
+                "non-water hetero components: {0} atoms "
+                "(resnames: {1})".format(
+                    hetero.numAtoms(),
+                    ", ".join(sorted(np.unique(hetero.getResnames())))))
 
-    if hetero is not None:
-        components.append(
-            "non-water hetero components: {0} atoms "
-            "(resnames: {1})".format(
-                hetero.numAtoms(),
-                ", ".join(sorted(np.unique(hetero.getResnames())))))
+        if other is not None:
+            components.append(
+                "other components: {0} atoms "
+                "(resnames: {1})".format(
+                    other.numAtoms(),
+                    ", ".join(sorted(np.unique(other.getResnames())))))
 
-    if other is not None:
-        components.append(
-            "other non-protein components: {0} atoms "
-            "(resnames: {1})".format(
-                other.numAtoms(),
-                ", ".join(sorted(np.unique(other.getResnames())))))
+        # The advice names only what the structure actually holds, so a protein with
+        # a ligand is still pointed at 'protein' and only a complex is told about
+        # the wider selection.
+        present = [(name, keyword) for name, keyword, selection in
+                   (('protein', 'protein', protein),
+                    ('nucleic acid', 'nucleic', nucleic)) if selection is not None]
+        _warn("The atoms supplied to calcChannels() contain components other than "
+            "{1}: {0}. All supplied atoms except waters will be used for channel "
+            "analysis. To analyze only the {1}, provide an appropriate selection, "
+            "for example atoms.select('{2}').".format(
+                "; ".join(components),
+                " and ".join(name for name, _ in present),
+                " or ".join(keyword for _, keyword in present)))
 
-    _warn("The atoms supplied to calcChannels() contain non-protein components: "
-        "{0}. All supplied atoms except waters will be used for channel analysis. "
-        "To analyze only the protein structure, provide an appropriate "
-        "selection, for example atoms.select('protein').".format(
-            "; ".join(components)))
+    # How far the structure is protonated, measured on the biomolecule alone: waters
+    # are dropped before the diagram is built, and a solvated but otherwise bare
+    # structure would look protonated through its water hydrogens. Each kind of chain
+    # is scored against the hydrogens per heavy atom it should carry, since those
+    # differ: the standard amino acids hold about as many hydrogens as heavy atoms,
+    # so a complete protein sits near 1.0, while a nucleotide is much richer in heavy
+    # atoms -- phosphate oxygens and ring nitrogens bear none -- so a complete nucleic
+    # acid sits near 0.55. A mixed structure counts as protonated only when every kind
+    # of chain in it is, because hydrogens missing anywhere open interstices wherever
+    # the channel happens to run.
+    chains = [(selection, name, expected) for selection, name, expected in
+              ((protein, 'protein', 1.0), (nucleic, 'nucleic acid', 0.55))
+              if selection is not None]
+    if not chains:
+        rest = atoms.select('not water')
+        if rest is None:
+            return
+        chains = [(rest, 'structure', 1.0)]
+
+    n_hydrogen = 0
+    scarcest = None
+    for selection, name, expected in chains:
+        elements = np.char.upper(np.asarray(selection.getElements(), dtype=str))
+        count = int(np.count_nonzero(elements == 'H'))
+        heavy = int(np.count_nonzero(elements != 'H'))
+        n_hydrogen += count
+        # Fraction of the hydrogens a complete chain of this kind would carry, which
+        # puts protein and nucleic acid on one scale.
+        fraction = count / float(max(heavy, 1)) / expected
+        if scarcest is None or fraction < scarcest[0]:
+            scarcest = (fraction, name, count)
+
+    # A complete file scores within a few percent of 1.0, one that kept only its polar
+    # hydrogens about a fifth of that, and one straight from a refinement nothing, so
+    # the threshold has a wide margin either side and is not delicate.
+    fully_protonated = scarcest[0] >= 0.7
+
+    # An experimental structure generally carries no hydrogens -- X-ray and cryo-EM
+    # alike, since neither resolves them except at the very highest resolutions -- and
+    # its carbons keep their full vdW radius, so the ~0.6 A the missing H occupied is
+    # left as void, around every heavy atom at once, including buried contacts that
+    # never come apart. That is usually harmless, and is often defended as standing in
+    # for thermal motion: a probe of water size cannot enter those interstices anyway,
+    # and protonated and unprotonated runs agree from about 1.2 A upwards. Below that
+    # the probe is small enough to thread them and the interior percolates into a
+    # sponge rather than merely widening. Those routes might be fictitious, not the real
+    # ones made wider. So a sub-water probe needs real hydrogens -- all of them, since
+    # it is the apolar C-H that fill those interstices, and a structure holding only
+    # its polar hydrogens leaves them just as open as one holding none.
+    if inner_radius is not None and inner_radius < 1.2 and not fully_protonated:
+        _warn("inner_radius={0:.2f} is below 1.2 Å but the {1} {2}: the space "
+              "left by the missing H is then wide enough for the probe to pass, and "
+              "channels will be found through interstices that do not exist in the "
+              "real structure (their number can rise several-fold). Either add "
+              "hydrogens, or raise inner_radius to 1.2 Å or more, where protonated and "
+              "unprotonated structures give similar channels.".format(
+                  inner_radius, scarcest[1],
+                  "carries no hydrogens" if not scarcest[2] else
+                  "carries only {0:.0f}% of the hydrogens a complete one would".format(
+                      100.0 * scarcest[0])))
+
+    # The reverse mismatch. The 1.2 A floor above is a workaround for absent
+    # hydrogens, not a property of the probe, so a structure that carries them is
+    # being measured with a probe coarser than its own detail: narrow connections
+    # are reported closed rather than measured. Only a note -- nothing is wrong with
+    # the result, it is simply more conservative than the input requires.
+    if inner_radius is not None and inner_radius >= 1.2 and fully_protonated:
+        LOGGER.info("The structure carries its hydrogens ({0:.0f}% of what a complete "
+            "{1} would hold), so inner_radius={2:.2f} is more conservative than it needs "
+            "to be: the 1.2 Å floor exists only to keep a sub-water probe out of the "
+            "space that missing hydrogens leave open, and here that space is filled. A "
+            "smaller probe, down to about 0.9 Å, measures the narrow connections instead "
+            "of reporting them closed.".format(
+                100.0 * scarcest[0], scarcest[1], inner_radius))
+
+    # 'simple' builds an *unweighted* Delaunay of the atom centres, i.e. it
+    # ignores the differences between atomic radii. That approximation is worst
+    # when the radius spread is largest -- which is exactly when hydrogens (small
+    # vdW) are present -- so warn there and steer the user to a radius-aware mode.
+    # With H absent the heavy-atom radii are much closer, so 'simple' is more
+    # defensible and matches the heavy-atom-only input most tools accept (at the
+    # cost of over-large empty space where the missing H would sit).
+    if diagram == "simple" and n_hydrogen:
+        _warn("diagram='simple' with hydrogens present: the unweighted "
+            "Voronoi diagram ignores radius differences, which are largest when H "
+            "are present, so its topology and clearances are significantly less "
+            "accurate. Consider diagram='homogenized' (or 'weighted'), which "
+            "account for per-atom radii.")
 
 
 def getVmdModel(vmd_path, atoms, representation='NewCartoon'):
@@ -835,12 +937,13 @@ def showChannels(channels, model=None, surface=None):
     conda install open3d (for Anaconda users; version open3d-0.19.0 was used 
     during the development) or pip install open3d
     
-    :arg channels: A list of channel objects or a single channel object. Each 
-        channel should have a `getSplines()` method that returns two 
-        CubicSpline objects: one for the centerline and one for the radii.
+    :arg channels: A list of channel objects or a single channel object. Each
+        channel should have a `getSplines()` method that returns two
+        interpolators over one parameter domain: one for the centerline and one
+        for the radii.
     :type channels: list or single channel object
-    
-    :arg model: An optional Open3D TriangleMesh object representing the 
+
+    :arg model: An optional Open3D TriangleMesh object representing the
         molecular model, such as a protein. If provided, this model will be 
         rendered in the visualization.
         Model can be generated using getVmdModel() function.
@@ -1275,10 +1378,10 @@ def showSurfaceCavities(surface, cavities=None, model=None, show_surface=False,
     o3d.visualization.draw_geometries(meshes_to_visualize)
 
 def calcChannels(atoms, output_path=None, separate=False, start_point=None,
-    start_point_search=3.0, surf_radius=3, inner_radius=0.9, min_depth=5,
-    min_volume=None, max_volume=None, max_depth=None, sparsity=1,
+    start_point_search=3.0, surf_radius=15, inner_radius=1.2, min_depth=5,
+    min_volume=None, max_volume=None, max_depth=None, sparsity=6,
     cavities_only=False, diagram="homogenized", max_deviation=0.1, 
-    similarity=0.8, route_tolerance=1.0, return_details=False, **kwargs):
+    route_divergence=0.2, return_details=False, **kwargs):
     """Computes and identifies channels within a molecular structure using 
     Voronoi and Delaunay tessellations.
 
@@ -1330,6 +1433,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         after the number - ``out_sp13_lnk0_sp9.pqr`` runs from start point 13
         into start point 9 - so either end can be searched for. Start points are
         numbered largest void first and listed in the log; see ``seed_radius``.
+        A search that ran from a single start point tags nothing with it, every
+        object having the same one, and writes ``out_chl3.pqr``.
     :type separate: bool
 
     :arg start_point: Optional starting point for channel search. This can be
@@ -1340,6 +1445,13 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         the seed tetrahedron itself is picked. Coordinates must be given in Å.
         If an atomic selection is provided, its geometric center is used as the
          starting point.
+
+        A start point names a site, so it does more than move a seed: the search
+        is restricted to the single cavity holding the tetrahedron nearest the
+        point, and channels are reported for that site alone rather than one
+        bundle per cavity in the structure. The automatic passes that decide
+        where to start are skipped with it -- the chamber seeding and the
+        ``seed_volume`` floor both defer to the point.
     :type start_point: list, tuple, or ndarray (length 3), :class:`.Atomic`, or None
 
     :arg start_point_search: Only used when ``start_point`` is provided. Radius,
@@ -1349,27 +1461,81 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         caps all of their bottlenecks and appears as one shared bottleneck at the
         joint beginning of the bundle. Seeded instead is the widest tetrahedron within
         ``start_point_search`` of ``start_point`` that belongs to the same cavity, is
-        no shallower than the nearest one (so the seed cannot drift out towards the
-        mouth) and is reachable from it through that neighbourhood (so it stays in the
-        void the point sits in rather than crossing a wall). Default is 3.0; use 0 to
-        seed the nearest tetrahedron as-is.
+        at least ``min_depth`` below the surface (so the seed cannot drift out towards
+        the mouth) and is reachable from the nearest one through that neighbourhood (so
+        it stays in the void the point sits in rather than crossing a wall). The seed
+        may therefore sit a little shallower than ``start_point`` itself, which is
+        usually placed on a ligand or a catalytic residue and often lies deeper than
+        the widest part of the pocket around it.
+
+        It is a requirement and not only a search budget: the search must begin
+        within this distance of the point, and if no cavity has a tetrahedron that
+        close, no channels are computed and a warning reports how far the nearest one
+        is and where it lies, so that ``start_point`` can be corrected or
+        ``start_point_search`` raised. Seeding the nearest tetrahedron however far
+        away it sits would answer a point that misses the void -- the centroid of a
+        residue selection often lands inside an atom -- with channels through whatever
+        cavity happens to lie nearest, and nothing in the result would say so.
+
+        Default is 3.0; use 0 to seed the nearest tetrahedron as-is, which asks for no
+        neighbourhood and so imposes no distance requirement either.
     :type start_point_search: float
 
-    :arg surf_radius: The first radius threshold used during the deletion of simplices, 
-        which is used to define the outer surface of the channels. Default is 3
+    :arg surf_radius: Radius, in Angstrom, of the probe that says what counts as
+        the outside. The tessellation is eroded from the boundary inward wherever
+        this probe fits, so everything it can reach is exterior and what it cannot
+        enter is the void the channels are traced through. Default is 15.
+
+        It is deliberately large. The erosion is followed by the local peel of
+        ``min_enclosure``, which strips the shell of exterior the probe bridged
+        over rather than entered, so where the erosion *stops* is decided by
+        burial and not by this radius. Above about 3.5 Angstrom the reported
+        channels stop moving: across the test structures the result is identical,
+        channel for channel, from 3.5 up to 20, and the run is no slower at the
+        top of that range than at the bottom. The default sits high in the
+        plateau rather than at its edge.
+
+        What the value has to be large enough for is a wide pore. A probe smaller
+        than the pore passes through it, so the lumen is classified as outside and
+        carved away, and only the pockets around it are reported; the structure is
+        turned inside out with no sign that anything went wrong. The probe must
+        therefore exceed the radius of the widest opening that should count as
+        interior - for a channel-forming protein or a large assembly that is well
+        above the 3 Angstrom values common for compact enzymes, hence the default.
+
+        For a globular protein any value in the plateau gives the same answer, so
+        lowering it is safe but buys nothing. Note that ``calcSurfaceCavities``
+        does not use this default: a surface pocket is shallow and open by
+        definition, and it sets its own, smaller radius.
+
+        One caveat applies to ``diagram="weighted"`` only. That path truncates the
+        Apollonius diagram at ``max(2 * surf_radius, 8)`` Angstrom of clearance, so
+        a large radius here makes an already expensive tessellation much more so.
+        The weighted diagram is experimental; with the default radius, expect it
+        to be impractical on anything but small structures.
     :type surf_radius: float
 
     :arg inner_radius: The second radius threshold used to define the inner surface of
-        the channels. Default is 0.9.
+        the channels. Default is 1.2, which is the smallest value safe on a
+        structure without hydrogens.
 
         Below about 1.2 Angstrom the probe is smaller than a water molecule, and
         then the structure must carry explicit hydrogens. Without them, every
         carbon keeps its full vdW radius while the space its hydrogens occupied is
         left empty, and a sub-water probe is small enough to thread those
         interstices: the interior percolates into a sponge and the channel count
-        can rise several-fold. At 1.2 Angstrom and above, protonated and 
-        unprotonated structures give the same channels, and an X-ray file may
-        be used as it comes. A warning is issued for the unsafe combination.
+        can rise several-fold. At 1.2 Angstrom and above, protonated and
+        unprotonated structures give similar channels, and an X-ray file may
+        be used as it comes. A warning is issued for the unsafe combination, so
+        go below the default only on a fully protonated structure -- partial
+        protonation does not count, since it is the apolar hydrogens that fill
+        those interstices.
+
+        The floor is a workaround for absent hydrogens rather than a property of
+        the probe, so on a structure that carries them the default is coarser
+        than the input deserves and narrow connections are reported closed
+        instead of measured. That case is noted too, and about 0.9 Angstrom is
+        then a reasonable probe.
 
         Note that this sets where channels are traced, not how wide the reported
         ones end up being: a channel can be narrower than ``inner_radius`` at its
@@ -1391,26 +1557,29 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
         Like ``bottleneck``, it drops entries from the finished list and does not
         change the search: where a search may *start* is set by ``seed_volume``,
-        so raising this to report only the large channels never costs you the
-        seed that finds them. The two are also measured on different scales - a
-        channel volume is the probe sphere swept along the centerline, hence free
-        space, while a cavity or chamber volume sums the Delaunay tetrahedra it
-        holds - so the same number does not mean the same thing on both.
+        the floor on the void - cavity or chamber - a search runs from, so raising
+        this to report only the large channels never costs you the seed that finds
+        them. The two are also measured on different scales - a channel volume is
+        the probe sphere swept along the centerline, hence free space, while a
+        cavity or chamber volume sums the Delaunay tetrahedra it holds - so the
+        same number does not mean the same thing on both.
     :type min_volume: float
 
     :arg max_volume: Maximum volume allowed for a channel/cavity to be 
         retained. Default is None.
     :type max_volume: float
 
-    :arg sparsity: Size of a channel surface opening (mouth), in Angstrom: how far
-        apart two exits must lie to count as separate openings. It is a floor on
-        the radius of a reported opening, so two channels leaving closer than
-        ``sparsity`` are treated as sharing that opening and are merged if they
-        also share a corridor (see ``similarity``); being applied *after* the
-        search, it can only merge channels there, never hide one, and is a
+    :arg sparsity: Smallest centre-to-centre distance, in Angstrom, at which two
+        channel surface openings (mouths) still count as separate. Two channels
+        leaving closer than this are treated as sharing one opening and are merged
+        if they also take the same corridor (see ``route_divergence``). It acts as a
+        floor: where the tessellation already measures the two mouths as wider
+        than ``sparsity``, their own radii decide instead, so the value only sets
+        the minimum separation a reported pair of openings can have. Being applied
+        *after* the search, it can only merge channels, never hide one, and is a
         reporting preference rather than part of the geometry. A higher value
         reports fewer channels. It has no effect on the cavities, which are found
-        from the exit tetrahedra before any thinning. Default is 1.
+        from the exit tetrahedra before any merging. Default is 6.
     :type sparsity: float
 
     :arg diagram: 
@@ -1428,7 +1597,13 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         using the third-party ``vorpy`` package (with a compiled kernel when
         ``numba`` is available). This is the exact diagram the "homogenized" mode
         approximates, at a higher cost (~ 100x slower, for 4000 atoms). To use this
-        approach install ``vorpy`` library using ``pip install vorpy3``. 
+        approach install ``vorpy`` library using ``pip install vorpy3``.
+
+        Treat "weighted" as experimental. Besides the cost of the tessellation
+        itself, it is the one mode whose diagram depends on ``surf_radius``: it is
+        truncated at ``max(2 * surf_radius, 8)`` Angstrom of clearance, so the
+        default radius makes it far more expensive again, and lowering
+        ``surf_radius`` to keep it affordable is the trade-off to be aware of.
     :type diagram: str
 
     :arg max_deviation: Maximum tolerated deviation, in Angstrom, between the 
@@ -1450,28 +1625,42 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         Only used when ``diagram = homogenized``.
     :type max_deviation: float
 
-    :arg similarity: Fraction (0-1) of the **longer** of two channels, measured
-        in Angstrom along its centerline, that must run within
-        ``route_tolerance`` of the other one for the two to count as the same
-        corridor. Two channels are merged (cheapest
-        kept) only when they take the same corridor **and** leave through the
-        same opening (see ``sparsity``); a corridor that forks near the surface
-        and exits twice is one tunnel, but two different corridors to one opening,
-        or one corridor reaching two openings, are two tunnels. The comparison is
-        geometric rather than a shared prefix of tetrahedra, so it is unaffected
-        by *where* two routes diverge (variants that split and rejoin still count
-        as one), by containment (a long route is not deleted as the "duplicate" of
-        a short one it happens to start with), and by ``max_deviation`` (a
-        tetrahedron count is not mesh-invariant; Angstrom are). ``1.0`` merges
-        only routes that coincide along their whole length; ``0.0`` merges every
-        channel that shares an opening. Default is 0.8.
-    :type similarity: float
+    :arg route_divergence: How far, in Angstrom, two channels may part company
+        per Angstrom of channel, and still count as one. Each channel is a tube -
+        the centerline plus the clearance around it - and at every point the
+        measurement is the gap between the two tube *surfaces*: negative where
+        they overlap, since two clearance balls that share a point have no atom
+        between them and the routes are locally the same corridor. The gaps that
+        are positive are integrated along both routes and divided by the average
+        of the two channel lengths, so how far apart they get and how much of the
+        route is involved enter one number: a two Angstrom arm off a ninety
+        Angstrom channel reads differently from the same arm off a ten Angstrom
+        one. ``0.0`` merges only pairs whose tubes touch along their whole
+        length; larger values tolerate more divergence.
 
-    :arg route_tolerance: How far apart, in Angstrom, two centerlines may drift
-        and still count as the same corridor when computing ``similarity``. Larger values merge more
-        aggressively (nearby parallel routes read as one tunnel); smaller values
-        report finer route variants separately. Default is 1.0.
-    :type route_tolerance: float
+        Measuring surfaces rather than centerlines is what lets a single value
+        serve everywhere, the question having no absolute scale: two paths a
+        couple of Angstrom apart in a wide chamber have nothing between them,
+        while the same distance in a narrow throat spans a wall.
+
+        Two channels are merged (cheapest kept) only when they take the same
+        corridor **and** leave through the same opening (see ``sparsity``); a
+        corridor that forks near the surface and exits twice is one tunnel, but
+        two different corridors to one opening, or one corridor reaching two
+        openings, are two tunnels. The comparison is geometric rather than a
+        shared prefix of tetrahedra, so it is unaffected by *where* two routes
+        diverge - variants that split and rejoin still count as one - and by
+        ``max_deviation``, a tetrahedron count not being mesh-invariant where
+        Angstrom are.
+
+        Default is 0.2, inside the band over which the answer does not change:
+        over every comparison the dedup makes on the test corpus, the pairs it
+        merges score at most 0.161 and the pairs it keeps at least 0.208. That
+        band is narrow, and the two ways out of it are not equally bad - set too
+        high it merges a corridor away, and a channel that is not reported
+        cannot be noticed, while set too low it reports a duplicate, which can
+        be seen and judged.
+    :type route_divergence: float
 
     :arg return_details: If True return an additional dictionary containing
         internal calculation data, including the channel calculator, simplices,
@@ -1529,15 +1718,31 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         explicit starting point is where the search begins.
     :type seed_radius: float
 
-    :arg seed_volume: Smallest chamber, in cubic Angstrom, that may seed a channel
+    :arg seed_volume: Smallest void, in cubic Angstrom, that may seed a channel
         search, measured on the cavity scale (Delaunay tetrahedra summed).
-        Default is 30, roughly the van der Waals volume of a water molecule.
+        Default is 50.
 
-        A chamber under it (see ``seed_radius``) is taken for tessellation debris
-        rather than a site and gets no starting point of its own. Nothing is lost
-        by that, since the cavity around it is searched anyway and a chamber that
-        seeds nothing still conducts. Raise it to seed only the roomy lobes of a
-        branched cavity; ``None`` seeds every chamber found.
+        It applies to both kinds of search site, on that one scale: to every
+        chamber (see ``seed_radius``), and to every cavity, since a cavity holding
+        no chamber is itself searched whole from a seed of its own. A void under it
+        is taken for tessellation debris rather than a site.
+
+        The two cases differ in what that costs. A *chamber* under the floor, in a
+        cavity that clears it, costs nothing: the cavity is searched from its other
+        seeds either way, and a chamber that seeds nothing still conducts, so the
+        routes through it are still found. A *cavity* under the floor is not
+        searched at all, and neither is anything inside it - which is the point:
+        the tessellation leaves single-tetrahedron slivers lying wholly in the
+        surface layer, and such a sliver is its own mouth. It reports either
+        nothing (it has no target to path to, and comes out as sealed) or a
+        one-step channel that is a facet of the surface rather than a tunnel. A low
+        ``min_depth`` is what exposes them in numbers, but nothing except their size
+        tells them from a real void at any depth.
+
+        Raise it to seed only the roomy lobes of a branched cavity; ``None``
+        applies no floor and seeds every cavity and chamber found. Passing
+        ``start_point`` overrides it completely, since an explicit starting point
+        is where the search begins.
 
         It is deliberately not ``min_volume``: that one is a floor on what gets
         *reported*, and tying the two would mean that asking for only the large
@@ -1625,7 +1830,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         wide, low-cost routes along the outside of the protein. Erosion continues
         while the tetrahedra at the front are *open*, meaning that fewer than
         ``min_enclosure`` of the directions leaving them run into protein within
-        :data:`ENCLOSURE_RANGE` Angstrom, and halts at the first buried layer.
+        the reach of :meth:`.ChannelCalculator.calcEnclosure`, and halts at the
+        first buried layer.
 
         Bounding the erosion by size instead does not work. A count of tetrahedron
         layers is not mesh-invariant, as a layer is one tetrahedron thick and
@@ -1654,15 +1860,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         the ``surf_radius`` dependence that ``min_enclosure`` exists to remove.
     :type max_peel_depth: float or None
         
-    :arg restrict_channels_to_start_point: Only used when ``start_point`` is
-        provided. If True (default), the channel search is restricted to the
-        single cavity whose closest tetrahedron is globally nearest to
-        ``start_point``, so  channels are computed only for the region around
-        that point instead of one channel bundle per detected cavity. If False,
-        ``start_point`` merely overrides the seed (starting) tetrahedron of
-        every cavity and channels are still computed for all cavities.
-    :type restrict_channels_to_start_point: bool
-
     :arg edge_cost: How each Voronoi edge is priced in the Dijkstra tunnel search.
         ``"integral"`` prices each edge by the integral of its clearance profile
         along the edge, which is mesh-invariant. ``"bottleneck"`` uses the legacy
@@ -1714,8 +1911,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     
     To save the results as PDB file:
     channels, surface = calcChannels(atoms, output_path="channels.pdb",
-                                     separate=False, surf_radius=3, inner_radius=0.9, min_depth=5,
-                                     bottleneck=1, sparsity=3) """
+                                     separate=False, surf_radius=15, inner_radius=1.2, min_depth=5,
+                                     bottleneck=1, sparsity=6) """
 
     # Advanced options, accepted as keyword arguments only and kept out of the
     # signature above, which is long enough already. These are settings a normal
@@ -1723,10 +1920,9 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     CHANNELS_ADVANCED_OPTIONS = {
         'bottleneck': inner_radius,
         'seed_radius': max(1.4, inner_radius),
-        'seed_volume': 30.0,
+        'seed_volume': 50.0,
         'max_seeds': 20,
         'chamber_links': True,
-        'restrict_channels_to_start_point': True,
         'min_enclosure': 0.70,
         'max_peel_depth': None,
         'edge_cost': None,
@@ -1753,7 +1949,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     seed_volume = options['seed_volume']
     max_seeds = options['max_seeds']
     chamber_links = options['chamber_links']
-    restrict_channels_to_start_point = options['restrict_channels_to_start_point']
     min_enclosure = options['min_enclosure']
     max_peel_depth = options['max_peel_depth']
     edge_cost = options['edge_cost']
@@ -1824,47 +2019,10 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                          "integral cannot price. Use edge_cost='bottleneck' (the "
                          "default for diagram='weighted') or None.")
     
-    _reportAtomsInputComposition(atoms)
+    _reportAtomsInputComposition(atoms, inner_radius, diagram)
     atoms = atoms.select('not water') # water is excluded from the selection
     calculator = ChannelCalculator(atoms, inner_radius=inner_radius, sparsity=sparsity,
-                                   route_tolerance=route_tolerance,
                                    edge_cost=edge_cost)
-
-    elements = np.char.upper(np.asarray(atoms.getElements(), dtype=str))
-    has_hydrogens = bool(np.any(elements == 'H'))
-
-    # An experimental structure generally carries no hydrogens -- X-ray and cryo-EM
-    # alike, since neither resolves them except at the very highest resolutions -- and
-    # its carbons keep their full vdW radius, so the ~0.6 A the missing H occupied is
-    # left as void, around every heavy atom at once, including buried contacts that
-    # never come apart. That is usually harmless, and is often defended as standing in
-    # for thermal motion: a probe of water size cannot enter those interstices anyway,
-    # and protonated and unprotonated runs agree from about 1.2 A upwards. Below that
-    # the probe is small enough to thread them and the interior percolates into a
-    # sponge rather than merely widening. Those routes might be fictitious, not the real
-    # ones made wider. So a sub-water probe needs real hydrogens.
-    if not has_hydrogens and inner_radius < 1.2:
-        _warn("structure has no hydrogens and inner_radius={0:.2f} is below 1.2 Å: the space "
-              "left by the missing H is then wide enough for the probe to pass, and "
-              "channels will be found through interstices that do not exist in the "
-              "real protein (their number can rise several-fold). Either add "
-              "hydrogens, or raise inner_radius to 1.2 Å or more, where protonated and "
-              "unprotonated structures give the same channels.".format(inner_radius))
-
-    if diagram == "simple":
-        # 'simple' builds an *unweighted* Delaunay of the atom centres, i.e. it
-        # ignores the differences between atomic radii. That approximation is worst
-        # when the radius spread is largest -- which is exactly when hydrogens (small
-        # vdW) are present -- so warn there and steer the user to a radius-aware mode.
-        # With H absent the heavy-atom radii are much closer, so 'simple' is more
-        # defensible and matches the heavy-atom-only input most tools accept (at the
-        # cost of over-large empty space where the missing H would sit).
-        if has_hydrogens:
-            _warn("diagram='simple' with hydrogens present: the unweighted "
-                "Voronoi diagram ignores radius differences, which are largest when H "
-                "are present, so its topology and clearances are significantly less "
-                "accurate. Consider diagram='homogenized' (or 'weighted'), which "
-                "account for per-atom radii.")
 
     coords = atoms.getCoords()
     vdw_radii = calculator.getVdwRadii(atoms.getElements())
@@ -1991,25 +2149,68 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     c_cavities = calculator.findGroups(s_clr.neigh)
     c_surface_cavities = calculator.getSurfaceCavities(c_cavities, s_clr.simp,
                                                        l_second_layer_simp,
-                                                       s_clr, coords,
-                                                       vdw_radii, sparsity,
-                                                       mouth_oracle)
+                                                       s_clr, mouth_oracle)
 
     calculator.findDeepestTetrahedra(c_surface_cavities, s_clr.neigh, s_clr.verti,
                                      coords, s_clr.simp)
     if start_point is not None:
         c_surface_cavities = calculator.setStartingTetrahedraFromPoint(
             c_surface_cavities, s_clr.verti, start_point, coords, vdw_radii,
-            s_clr.simp, s_clr.neigh, restrict_channels_to_start_point,
-            start_point_search)
+            s_clr.simp, s_clr.neigh, start_point_search, min_depth)
 
     c_filtered_cavities = calculator.filterCavities(c_surface_cavities, min_depth)
-    LOGGER.report('Surface cavities: {0} found, {1} deeper than '
-        'min_depth={2:.1f} Å and {3}, in %.2fs.'.format(
-            len(c_surface_cavities), len(c_filtered_cavities), float(min_depth),
-            'kept' if cavities_only else 'searched for channels'),
-        '_prody_channels_cavities')
-    
+
+    # seed_volume is a floor on where a search may start, and a cavity is a search
+    # site exactly as a chamber is: a cavity holding no chamber is searched whole,
+    # from a seed of its own, and one whose chambers all fall under the floor falls
+    # back to the same. So the floor is applied to the cavities here as well as to
+    # the chambers in setStartingTetrahedraFromChambers, and means one thing
+    # throughout - no void below it seeds a search, whether it is a lobe of a large
+    # cavity or a cavity entire. Both are measured on the Delaunay scale the site
+    # table reports.
+    #
+    # Without this a single-tetrahedron sliver of tessellation debris became a
+    # search site bottleneck = min(gatesof its own whenever min_depth let it through: such a sliver lies
+    # wholly in the surface layer, so it is its own mouth, and it reports either
+    # nothing (sealed, having no target to path to) or a one-step channel that is
+    # a facet of the surface rather than a tunnel. A low min_depth is what exposes
+    # them - measured at 12 of 15 sites on 1grm and 300+ of 336 on LinB with
+    # min_depth=0 - but nothing except their size distinguishes them at any depth.
+    #
+    # Skipped when start_point is given: the user has said where the search
+    # begins, and that wins over any floor.
+    debris = 0
+    if not cavities_only:
+        calculator.calculate_cavity_volumes(c_filtered_cavities, s_clr.simp,
+                                            coords)
+
+        if start_point is None and seed_volume is not None:
+            searched = calculator.filterCavitiesByVolume(
+                c_filtered_cavities, min_volume=seed_volume)
+            debris = len(c_filtered_cavities) - len(searched)
+            if debris and not searched:
+                _warn('every cavity is smaller than seed_volume={0:g} Å³, so no '
+                      'search site is left and no channel can be found. Lower '
+                      'seed_volume, or set it to None, to search the small '
+                      'cavities too.'.format(float(seed_volume)))
+            c_filtered_cavities = searched
+
+    if debris:
+        report = ('Cavities: {0} found, {1} deeper than min_depth={2:.1f} Å, {3} '
+                  'of them at least seed_volume={4:g} Å³ and searched for '
+                  'channels; the {5} smaller ones are tessellation debris and are '
+                  'left unsearched, in %.2fs.').format(
+                      len(c_surface_cavities), len(c_filtered_cavities) + debris,
+                      float(min_depth), len(c_filtered_cavities),
+                      float(seed_volume), debris)
+    else:
+        report = ('Cavities: {0} found, {1} deeper than min_depth={2:.1f} Å and '
+                  '{3}, in %.2fs.').format(
+                      len(c_surface_cavities), len(c_filtered_cavities),
+                      float(min_depth),
+                      'kept' if cavities_only else 'searched for channels')
+    LOGGER.report(report, '_prody_channels_cavities')
+
     if cavities_only:
         if max_depth is not None:
             calculator.trimCavitiesByDepth(c_filtered_cavities, max_depth)
@@ -2023,9 +2224,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         if min_volume is not None or max_volume is not None:
             c_filtered_cavities = calculator.filterCavitiesByVolume(
                 c_filtered_cavities, min_volume, max_volume)
-    else:
-        calculator.calculate_cavity_volumes(c_filtered_cavities, s_clr.simp,
-                                            coords)
+    # The channel path has its volumes already: they are what the seed_volume
+    # floor above was applied to.
 
     # Largest first. Cavities come out of findGroups in connected-component
     # order, which follows tetrahedron indices, so cavity 0 was whichever void
@@ -2126,7 +2326,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
     for cavity in c_filtered_cavities:
         calculator.dijkstra(cavity, graph, simplices, neighbors, vertices,
-                            coords, vdw_radii, similarity,
+                            coords, vdw_radii, route_divergence,
                             chamber_labels if chamber_links else None)
     # Sites, not cavities: one Dijkstra runs per site, so the number of sites is
     # what the time divides into.
@@ -2198,6 +2398,14 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     for entry in channels + links:
         entry.origin = origins.get(int(np.asarray(entry.tetrahedra)[0]))
 
+    # An sp<n> tag tells one search site's objects from another's, so a run that
+    # searched from a single site has nothing to tell: every object would carry
+    # the same sp0 in its file name and its REMARK. The origins themselves are
+    # kept - they are what the table below counts by - and only the naming is
+    # dropped, so the files come out as chl0.pqr with a REMARK reading
+    # "channel 0" alone, as they did before multi-seed searching.
+    name_sites = len(origins) > 1
+
     # The far end of a link, named the way its near end is. Chamber labels are
     # internal to the carve, so they are translated here, where the start points
     # they stand for have just been numbered.
@@ -2214,6 +2422,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         "never reaches the surface)".format(
             len(links), '' if len(links) == 1 else 's')))
 
+    sealed = 0
     if origin_rows:
         # One row per site, in the order the sites are numbered. Laid out as a
         # table because every row says the same six things: written as sentences
@@ -2242,52 +2451,80 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
             if not (traced or linked):
                 # Why the site reports nothing; the bottleneck it failed and
                 # what to do about it are in the summary line below the table.
+                # Counted here rather than recomputed there, so that the number
+                # in that line is the number of rows marked here by definition.
                 note = '  sealed'
-            rows.append(['sp{0}'.format(index), where, '{0:.0f}'.format(volume),
+                sealed += 1
+            # The seed's own Voronoi vertex, written so that it can be pasted back
+            # as start_point to search this one site again - the automatic passes
+            # otherwise report which void they started from but never where, and
+            # the placement cannot be reproduced or adjusted without it.
+            seed_vertex = vertices[seed_rows[index][2]]
+            rows.append(['sp{0}'.format(index),
+                         '[{0:.3f}, {1:.3f}, {2:.3f}]'.format(*seed_vertex),
+                         where, '{0:.0f}'.format(volume),
                          '{0:.1f}'.format(depth),
                          str(len(traced)) if traced else '-',
                          str(len(linked)) if linked else '-', note])
 
-        header = ['site', 'void', 'volume [Å³]', 'depth [Å]',
+        header = ['site', 'start_point [Å]', 'void', 'volume [Å³]', 'depth [Å]',
                   'channels', 'links']
+
+        # A single search site names nothing with an sp<n> - every row would be
+        # sp0, and nothing written carries the tag either - and it can hold no
+        # link, which needs a second site to arrive at. Both columns are dropped
+        # there, leaving the one row to say where the search began, what the void
+        # is and what came out of it. The notes are kept out of the widths, being
+        # ragged text at the end of the row rather than a column of it, so the
+        # coordinates sit ahead of them rather than being run into by an arrow.
+        keep = range(len(header)) if name_sites else [1, 2, 3, 4, 5]
+        notes = [row[len(header)] for row in rows]
+        rows = [[row[column] for column in keep] for row in rows]
+        header = [header[column] for column in keep]
+        # site, start_point and void are text and read left-aligned; the counts
+        # and measurements after them are compared down the page and go right.
+        labels = 3 if name_sites else 2
         widths = [max(len(row[column]) for row in [header] + rows)
                   for column in range(len(header))]
 
         def formatRow(row):
-            # The two labels left, the four numbers right, so that a column of
-            # volumes or counts can be compared by eye down the page.
+            # The labels left, the numbers right, so that a column of volumes or
+            # counts can be compared by eye down the page.
             return '    ' + '  '.join(
-                text.ljust(width) if column < 2 else text.rjust(width)
+                text.ljust(width) if column < labels else text.rjust(width)
                 for column, (text, width) in enumerate(zip(row, widths)))
 
         LOGGER.info("Search sites (sp), the void each search ran from, largest "
-                    "first; sp<n> tags every channel, link and output file:")
+                    "first; sp<n> tags every channel, link and output file:"
+                    if name_sites else
+                    "The void the search ran from:")
         LOGGER.info(formatRow(header))
-        for row in rows:
-            LOGGER.info(formatRow(row[:len(header)]) + row[len(header)])
+        for row, note in zip(rows, notes):
+            LOGGER.info(formatRow(row) + note)
         LOGGER.info("    (site volumes measure the void itself and are not on "
                     "the swept-sphere scale of the channel volumes)")
 
-    # A chamber can end up reporting nothing at all: its own channels dropped by
-    # the dedup as duplicates of a shallower chamber's shorter ones, and its link
-    # then dropped by the bottleneck filter because the neck it would leave
-    # through is too tight for the probe. That is a real finding - the chamber is
-    # sealed at this width - but an invisible one, because nothing is written
-    # about a chamber that reports no object, and the void simply goes missing
-    # from the output.
-    if chamber_labels is not None:
-        reported = set()
-        for objects in (channels, links):
-            for entry in objects:
-                reported.add(int(np.asarray(entry.tetrahedra)[0]))
-        sealed = sum(1 for cavity in c_filtered_cavities
-                     for seed in cavity.seed_chambers if int(seed) not in reported)
-        if sealed:
-            LOGGER.info("The {0} site{1} marked sealed above report neither a "
-                        "channel nor a link: every route out of them is "
-                        "narrower than bottleneck={2:.2f} Å. Lower it to see "
-                        "how they connect.".format(
-                            sealed, '' if sealed == 1 else 's', bottleneck))
+    # A site can end up reporting nothing at all: its own channels dropped by the
+    # dedup as duplicates of a shallower site's shorter ones, and its link then
+    # dropped by the bottleneck filter because the neck it would leave through is
+    # too tight for the probe. That is a real finding - the void is sealed at this
+    # width - but an invisible one, because nothing is written about a site that
+    # reports no object, and the void simply goes missing from the output.
+    #
+    # A cavity searched whole is a site on the same terms as a chamber, so it is
+    # counted here on the same terms: the count is the number of rows the table
+    # marked sealed, whichever kind of void they name. Counting only the chamber
+    # seeds (cavity.seed_chambers) made the summary contradict the table it
+    # summarises - "The 1 site marked sealed above" under a table marking
+    # hundreds.
+    if sealed:
+        LOGGER.info("The {0} site{1} marked sealed above report neither a "
+                    "channel nor a link: no route out of them survived - either "
+                    "narrower than bottleneck={2:.2f} Å, or dropped as a "
+                    "duplicate of a shallower site's, or the void is its own "
+                    "mouth and has nowhere to path to. Lower bottleneck to see "
+                    "how the first kind connect.".format(
+                        sealed, '' if sealed == 1 else 's', bottleneck))
 
     if output_path:
         output_path = Path(output_path)
@@ -2322,19 +2559,28 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                 " and {0} links to {1}".format(len(links), links_path)))
         else:
             LOGGER.info("Saving {0} channels{1} to directory {2}, one file per "
-                        "object named sp<site>_chl<n>{3}.".format(
+                        "object named {3}chl<n>{4}.".format(
                             len(channels),
                             '' if not links else
                             " and {0} links".format(len(links)),
                             output_path.parent,
-                            '' if not links else " and sp<site>_lnk<n>"))
+                            'sp<site>_' if name_sites else '',
+                            '' if not links else
+                            " and sp<site>_lnk<n>" if name_sites
+                            else " and lnk<n>"))
         calculator.saveChannelsToPdb(channels, output_path, separate,
-                                     separate_stem=separate_stem)
+                                     separate_stem=separate_stem,
+                                     name_sites=name_sites)
         if links:
             calculator.saveChannelsToPdb(links, links_path, separate,
                                          tag='lnk', label='link',
                                          separate_path=output_path,
-                                         separate_stem=separate_stem)
+                                         separate_stem=separate_stem,
+                                         name_sites=name_sites)
+        # Only for a run told a directory. Told a file, the parent is usually
+        # the working directory, and a run has no business leaving a script there.
+        if into_directory:
+            _writeVisScript(output_path.parent)
     else:
         LOGGER.info("No output path given.")
 
@@ -2385,11 +2631,12 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
        ``max_end_to_end``, ``min_bottleneck``, ``max_bottleneck``, ``min_length``, 
        ``max_length``, ``min_volume``, ``max_volume``). 
     
-    :arg channels: A list of channel objects or a single channel object. Each 
-        channel should have a `getSplines()` method that returns two 
-        CubicSpline objects: one for the centerline and one for the radii.
+    :arg channels: A list of channel objects or a single channel object. Each
+        channel should have a `getSplines()` method that returns two
+        interpolators over one parameter domain: one for the centerline and one
+        for the radii.
     :type channels: list or single channel object
-    
+
     :arg details: Additional calculation data returned by
         :func:`calcChannels` with ``return_details=True``. The dictionary must
         contain ``calculator``, ``simplices``, ``neighbors``, ``vertices``,
@@ -2555,7 +2802,8 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         # As in calcChannels: a directory names no run, so its placeholder file
         # name is kept out of the per-pore ones.
         separate_stem = None
-        if output_path.is_dir():
+        into_directory = output_path.is_dir()
+        if into_directory:
             output_path = output_path / "pores.pqr"
             separate_stem = ''
         elif output_path.suffix not in (".pdb", ".pqr"):
@@ -2569,6 +2817,9 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         calculator.saveChannelsToPdb(pores, output_path, separate=separate,
                                      tag='pore', label='pore',
                                      separate_stem=separate_stem)
+        # as in calcChannels, and globbing the pores rather than the channels
+        if into_directory:
+            _writeVisScript(output_path.parent, 'pore*.pqr')
 
     return pores
 
@@ -2842,11 +3093,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         Default is False.
     :type separate: bool
 
-    :arg start_point: Optional starting point for channel search. If provided, 
-        the algorithm will use the tetrahedron whose Voronoi vertex is closest 
-        to this point as the starting tetrahedron (overriding the default automatic 
-        seed selection based on the deepest tetrahedron). Coordinates must be given in Å.
-    :type start_point: list, tuple, or ndarray (length 3), or None 
+    :arg start_point: Optional starting point for channel search, applied to every
+        frame. If provided, the search is restricted to the cavity holding the
+        tetrahedron nearest the point and is seeded there, overriding the default
+        automatic seed selection; see :func:`calcChannels` for how the seed is
+        picked and for ``start_point_search``, which bounds how far from the point
+        it may lie. Coordinates must be given in Å.
+    :type start_point: list, tuple, or ndarray (length 3), or None
 
     :arg max_proc: Maximum number of parallel processes used for calculation. 
         If 1, files are processed serially. If None, all available CPU
@@ -2875,8 +3128,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, surf_radius=3, 
-                                    inner_radius=0.9, min_depth=5, bottleneck=1, sparsity=3)
+                                    output_path="channels.pdb", separate=False, surf_radius=15,
+                                    inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
                                     output_path="channels.pdb", separate=False, 
@@ -3737,7 +3990,10 @@ def _sampleObjectSpheres(object, num_samples=5):
     """``(centres, radii)`` of the probe spheres along a channel or a pore.
 
     ``num_samples`` points per tetrahedron of the route, evenly spaced in the
-    spline parameter. This is the one definition of "the spheres of an object":
+    spline parameter - which, the centerline being parameterized by the square
+    root of the step between circumcenters, puts them roughly evenly along the
+    route rather than crowding wherever circumcenters happen to cluster.
+    This is the one definition of "the spheres of an object":
     :func:`getChannelAtoms` and
     :meth:`~ChannelCalculator.saveChannelsToPdb` write these very spheres out as
     FIL atoms, and the lining queries take them straight from here, since the
@@ -5152,11 +5408,12 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
     :type max_depth: float
 
     :arg sparsity: Deprecated and ignored; accepted only so that existing calls
-        keep working. It never affected surface cavities: it thinned the sampling
-        of the mouth (exit) tetrahedra used as termini by the *channel* search,
-        and no cavity property reads that thinned set. Cavity extent, depth,
-        volume and filtering are all derived from the unthinned exit tetrahedra,
-        so passing 1 or 15 returns the same cavities.
+        keep working. It never affected surface cavities. In :func:`calcChannels`
+        it is the smallest separation at which two channel openings still count
+        as separate, applied when the finished channels are deduplicated, and no
+        cavity property reads it. Cavity extent, depth, volume and filtering are
+        all derived from the exit tetrahedra, so passing 1 or 15 returns the same
+        cavities.
     :type sparsity: int
 
     :arg min_tetrahedra: Minimum number of tetrahedra required for a cavity to
@@ -5172,9 +5429,7 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
 
         The volume is the cavity's Delaunay tetrahedra summed. Their corners are
         atom centres, so they lie against the wall of the pocket rather than
-        filling it, and the number is not the room inside: on ``dbja_prot`` the
-        largest cavity reports 485 A^3, while the probes that fit at its vertices
-        occupy some 620 A^3 of the space below the surface. Compare a threshold
+        filling it, and the number is not the room inside. Compare a threshold
         against other cavities, then, not against a volume measured some other
         way - and note that a channel volume is on another scale entirely, the
         probe swept along the centerline.
@@ -5217,9 +5472,9 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
 
     if sparsity is not None:
         _warn("sparsity is deprecated in calcSurfaceCavities and is "
-              "ignored. It thinned the mouth tetrahedra sampled as termini "
-              "by the channel search; cavities are built from the unthinned "
-              "ones, so it never changed them.")
+              "ignored. It separates the openings of finished channels in "
+              "calcChannels; cavities are built from the exit tetrahedra "
+              "before that, so it never changed them.")
 
     # No peel (min_enclosure=0). The enclosure peel strips the shell of true
     # exterior that a large surf_radius probe bridges over instead of entering, because it
@@ -5239,7 +5494,7 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
     return cavities, surface
 
 def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
-    sparsity_values=(1.0, 3.0, 5.0), min_depth_values=(3.0, 5.0, 10.0),
+    sparsity_values=(2.0, 6.0, 10.0), min_depth_values=(3.0, 5.0, 10.0),
     output_path='channel_parameter_grid', resolution=0.5, max_proc=2,
     start_point=None, **kwargs):
     """Calculate channels over a combination grid of parameters.
@@ -5259,8 +5514,8 @@ def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
         ``(1.2, 1.4, 1.6)``.
     :type inner_radius_values: float or sequence of float
 
-    :arg sparsity_values: Mouth-separation values tested in the grid. Default is
-        ``(1.0, 3.0, 5.0)``.
+    :arg sparsity_values: Mouth-separation values, in Angstrom, tested in the
+        grid. Default is ``(2.0, 6.0, 10.0)``.
     :type sparsity_values: float or sequence of float
 
     :arg min_depth_values: Minimum cavity depths tested in the grid. Default is
@@ -5295,7 +5550,7 @@ def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
 
     Example usage:
     channels_all, parameter_sets, occupancy_file = scanChannelParameters(
-        protein, inner_radius_values=[1.2, 1.4, 1.6], sparsity_values=[1, 3, 5],
+        protein, inner_radius_values=[1.2, 1.4, 1.6], sparsity_values=[2, 6, 10],
         min_depth_values=[3, 5, 10], output_path='channel_parameter_grid') """
 
     from itertools import product
@@ -5394,7 +5649,10 @@ def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
                     channel.length, channel.bottleneck, channel.volume,
                     curvature, cost))
 
-    calcChannelSurfaceOverlaps(pqr_files=pqr_files, output_file_name=str(occupancy_file))
+    calcChannelSurfaceOverlaps(pqr_files=pqr_files,
+                               output_file_name=str(occupancy_file),
+                               resolution=resolution,
+                               max_proc=max_proc)
     LOGGER.report('Channel parameters scan completed in %.2fs.', '_prody_scanChannelParameters')
 
     return channels_all, parameter_sets, str(occupancy_file)
@@ -5902,9 +6160,8 @@ class Cavity:
     def makeSurface(self):
         self.is_connected_to_surface = True
         
-    def setExitTetrahedra(self, exit_tetrahedra, end_tetrahedra):
+    def setExitTetrahedra(self, exit_tetrahedra):
         self.exit_tetrahedra = exit_tetrahedra
-        self.end_tetrahedra = end_tetrahedra
         
     def setStartingTetrahedron(self, tetrahedron):
         self.starting_tetrahedron = tetrahedron
@@ -5945,7 +6202,7 @@ class ChannelCalculator:
     # true width.
     CAVITY_MARKER_RADIUS = 1.00
 
-    def __init__(self, atoms, inner_radius=0.9, sparsity=1, route_tolerance=1.0,
+    def __init__(self, atoms, inner_radius=1.2, sparsity=6,
                  edge_cost='integral'):
         # Only the parameters the class actually consults are held here. surf_radius,
         # min_depth and bottleneck are stages of the pipeline, applied to the
@@ -5955,7 +6212,6 @@ class ChannelCalculator:
         self.atoms = atoms
         self.inner_radius = inner_radius
         self.sparsity = sparsity
-        self.route_tolerance = route_tolerance
         # 'integral' (clearance-profile integral) or 'bottleneck' (l/(d^2+b));
         # the Dijkstra edge weight in buildSparseGraph. Resolved per diagram by
         # calcChannels (weighted defaults to 'bottleneck').
@@ -5967,6 +6223,9 @@ class ChannelCalculator:
         # share one definition of width instead of recomputing it apart.
         self._vertex_clearance = None
         self._edge_bottleneck = None
+        # The real atoms and a tree over them, built by _enclosureAtoms only
+        # when an exchange of exits has to be judged.
+        self._enclosure_atoms = None
 
     def sphereFit(self, points, simplices, vertices, vdw_radii, r, rows=None):
         """Sum-based clearance test: for each tetrahedron, decide whether a probe
@@ -6096,9 +6355,10 @@ class ChannelCalculator:
 
         return simp, neigh, verti
 
-    def calcEnclosure(self, query, centers, tree=None):
+    def calcEnclosure(self, query, centers, tree=None, reach=25.0, rays=32,
+                      step=0.75, radius=1.7):
         """Fraction of the directions seen from each point of ``query`` that are
-        blocked by an atom within :data:`ENCLOSURE_RANGE` Angstrom.
+        blocked by an atom within ``reach`` Angstrom.
 
         A local, probe-independent measure of burial: a point in the open solvent
         sees sky in most directions, a point inside a channel is surrounded
@@ -6107,32 +6367,38 @@ class ChannelCalculator:
         Rays are marched outwards and a ray is dropped as soon as it is blocked,
         which is what keeps this affordable: in a buried region most directions
         hit protein within the first few Angstrom, and only the few that escape
-        are followed the whole way out. Marching costs
-        ``ENCLOSURE_RAYS x steps`` tree queries per point and so is all but
-        insensitive to how many atoms there are, whereas testing every atom in
-        range against every ray costs a multiple of the atom count, and with rays
-        this sparse nearly all of that work is wasted on atoms that lie near no
-        ray at all.
+        are followed the whole way out. Marching costs ``rays x steps`` tree
+        queries per point and so is all but insensitive to how many atoms there
+        are, whereas testing every atom in range against every ray costs a
+        multiple of the atom count, and with rays this sparse nearly all of that
+        work is wasted on atoms that lie near no ray at all.
 
         Pass the real atoms here, not the balls of a homogenized diagram: burial
         is a property of the protein, not of the tessellation. Atoms are all given
-        the same :data:`ENCLOSURE_RADIUS`, so one tree and one plain
-        nearest-neighbour test suffice. This is a burial heuristic and not a
-        surface calculation, and the alternative -- a per-atom radius, which no
-        nearest-neighbour query can express -- buys nothing that
-        ``min_enclosure`` cannot absorb.
+        the same ``radius``, so one tree and one plain nearest-neighbour test
+        suffice. This is a burial heuristic and not a surface calculation, and the
+        alternative -- a per-atom radius, which no nearest-neighbour query can
+        express -- buys nothing that ``min_enclosure`` cannot absorb.
 
-        :data:`ENCLOSURE_RAYS` is fixed rather than exposed, because it is part of
-        the definition of the quantity and not an accuracy knob. Adding rays is
-        not a free refinement: more directions discover more of the thin escape
-        routes out of a channel, so the enclosure of every point drifts downwards
-        and a threshold calibrated at one ray count does not carry over to
-        another.
+        The sampling is part of the definition of the quantity and not an accuracy
+        knob, which is why every caller that compares enclosures against a
+        threshold leaves it alone. Adding rays is not a free refinement: more
+        directions discover more of the thin escape routes out of a channel, so
+        the enclosure of every point drifts downwards and a threshold calibrated
+        at one ray count does not carry over to another.
 
         :arg query: points to evaluate, ``(n, 3)``.
         :arg centers: atom centres.
         :arg tree: optional prebuilt :class:`~scipy.spatial.cKDTree` over
             ``centers``, to avoid rebuilding it on every call.
+        :arg reach: how far a ray is followed before the direction counts as
+            open, in Angstrom. The default asks whether a point is inside the
+            protein at all; a few Angstrom asks the much more local question of
+            whether it sits in a niche.
+        :arg rays: how many directions are sampled.
+        :arg step: spacing of the samples along a ray, in Angstrom.
+        :arg radius: one radius for every atom, on the scale of a heavy-atom vdW
+            radius.
         :returns: ``n`` fractions in ``[0, 1]``."""
         query = np.asarray(query, dtype=float)
         if len(query) == 0:
@@ -6140,23 +6406,22 @@ class ChannelCalculator:
         if tree is None:
             tree = _kdTree(centers)
 
-        i = np.arange(ENCLOSURE_RAYS) + 0.5
-        phi = np.arccos(1 - 2 * i / ENCLOSURE_RAYS)
+        i = np.arange(rays) + 0.5
+        phi = np.arccos(1 - 2 * i / rays)
         theta = np.pi * (1 + 5 ** 0.5) * i              # Fibonacci sphere
         directions = np.stack([np.sin(phi) * np.cos(theta),
                                np.sin(phi) * np.sin(theta),
                                np.cos(phi)], axis=1)
 
-        blocked = np.zeros((len(query), ENCLOSURE_RAYS), dtype=bool)
+        blocked = np.zeros((len(query), rays), dtype=bool)
         live = np.ones_like(blocked)
-        for step in np.arange(ENCLOSURE_STEP,
-                              ENCLOSURE_RANGE + ENCLOSURE_STEP, ENCLOSURE_STEP):
+        for distance in np.arange(step, reach + step, step):
             point, ray = np.nonzero(live)
             if not len(point):
                 break
-            samples = query[point] + directions[ray] * step
-            hit = tree.query(samples, distance_upper_bound=ENCLOSURE_RADIUS,
-                             workers=-1)[0] <= ENCLOSURE_RADIUS
+            samples = query[point] + directions[ray] * distance
+            hit = tree.query(samples, distance_upper_bound=radius,
+                             workers=-1)[0] <= radius
             blocked[point[hit], ray[hit]] = True
             live[point[hit], ray[hit]] = False
 
@@ -6610,7 +6875,7 @@ class ChannelCalculator:
         return labels, self.calculateChamberVolumes(labels, simplices, points)
 
     def getSurfaceCavities(self, cavities, interior_simplices, second_layer,
-                           state, points, vdw_radii, sparsity, mouth_oracle=None):
+                           state, mouth_oracle=None):
         surface_cavities = []
         
         for cavity in cavities:
@@ -6631,8 +6896,7 @@ class ChannelCalculator:
                     if len(exit_tetrahedra) == 0:
                         continue
                 cavity.makeSurface()
-                end_tetrahedra = self.getEndTetrahedra(exit_tetrahedra, state.verti, points, vdw_radii, state.simp, sparsity)
-                cavity.setExitTetrahedra(exit_tetrahedra, end_tetrahedra)
+                cavity.setExitTetrahedra(exit_tetrahedra)
                 surface_cavities.append(cavity)
                 
         return surface_cavities
@@ -6640,10 +6904,10 @@ class ChannelCalculator:
 
     def mergeCavities(self, cavities, simplices):
         if not cavities:
-            # No cavities survived filtering (e.g. restrict_channels_to_start_point
-            # selected a single cavity shallower than min_depth). Return an empty
-            # (0, 4) slice so the pipeline yields zero channels instead of crashing
-            # in np.concatenate on an empty list.
+            # No cavities survived filtering (e.g. a start_point selected a single
+            # cavity shallower than min_depth, or none within start_point_search).
+            # Return an empty (0, 4) slice so the pipeline yields zero channels
+            # instead of crashing in np.concatenate on an empty list.
             return simplices[np.empty(0, dtype=np.intp)]
         merged_tetrahedra = np.concatenate([cavity.tetrahedra for cavity in cavities])
         return simplices[merged_tetrahedra]
@@ -6953,7 +7217,7 @@ class ChannelCalculator:
         return csr_matrix((weight, (rows, cols)), shape=(N, N))
 
     def dijkstra(self, cavity, graph, simplices, neighbors, vertices, points,
-                 vdw_radii, similarity=0.8, chamber_labels=None):
+                 vdw_radii, divergence=0.2, chamber_labels=None):
         # a single multi-target Dijkstra from the seed over the cavity subgraph,
         # then every exit path reconstructed from the predecessor tree - 
         # instead of one heap search per (seed, exit) pair.
@@ -6967,6 +7231,11 @@ class ChannelCalculator:
             return
         global_to_local = {tetra: i for i, tetra in enumerate(cavity_tetra)}
         cavity_graph = graph[np.ix_(cavity_tetra, cavity_tetra)]
+        # The same subgraph before the mouths stop conducting. The search out to
+        # the surface needs them absorbing, but the short hop from an opening to
+        # its own mouths does not: there the constraint only forces the path to
+        # detour around every neighbouring mouth. Used by _addOpeningChannels.
+        transit_graph = cavity_graph
 
         # A tunnel ends at the surface, but the Dijkstra cost has no such term:
         # it rewards width, and the widest places are the surface grooves. Left
@@ -6993,10 +7262,11 @@ class ChannelCalculator:
         # sum-based test in deleteSimplices3d to the per-atom clearance), so the
         # test is a no-op there; it earns its keep for diagram="simple", where
         # unequal radii break that identity.
-        # Local indices of the tetrahedra a channel is allowed to end at.
-        terminals_local = [global_to_local[int(t)]
-                           for t in np.asarray(cavity.end_tetrahedra)
-                           if int(t) in global_to_local]
+        # Local indices of the tetrahedra a channel is allowed to end at; filled
+        # from the mouths below. A surface cavity always has exit tetrahedra (it
+        # is classified as one by having them), so this stays empty only for a
+        # cavity that should produce no channels at all.
+        terminals_local = []
         exit_tetra = np.asarray(getattr(cavity, 'exit_tetrahedra',
                                         np.empty(0, dtype=np.intp)))
         if len(exit_tetra):
@@ -7020,15 +7290,19 @@ class ChannelCalculator:
             # not itself in the second layer and so still conducting - and
             # surface again somewhere else. That leak is real but narrow (the
             # twins sit 0.1-0.7 A from a mouth, in the surface shell at depth
-            # 1-4), and such a path always passes through the exit sphere of a
-            # channel that is already reported. It is therefore handled in
-            # _addDedupedChannels, which cuts a path at the first reported exit
-            # sphere it enters - the point where it truly leaves the protein -
-            # rather than walling the graph off against every mouth.
+            # 1-4). It is closed downstream rather than by walling the graph off
+            # against every mouth: a route is judged to have reached the surface
+            # when it enters a mouth's inscribed *ball*, so slipping past the
+            # tetrahedron does not slip past the opening. See the arrival test
+            # below.
             absorbing = [global_to_local[int(t)]
                          for t, c in zip(exit_tetra, clearance)
                          if c >= self.inner_radius and int(t) in global_to_local
                          and int(t) not in seeds]
+            absorbing_radius = np.array(
+                [c for t, c in zip(exit_tetra, clearance)
+                 if c >= self.inner_radius and int(t) in global_to_local
+                 and int(t) not in seeds])
             if absorbing:
                 # Zero the mouths' rows: edges *into* a mouth survive (a
                 # channel may end there), edges *out of* it are gone.
@@ -7041,7 +7315,64 @@ class ChannelCalculator:
             # one opening. See the comment at the target loop below.
             terminals_local = absorbing
 
-        candidates = []
+        # The mouth layer is one tetrahedron thick, so zeroing its outgoing edges
+        # does not actually stop a route from walking *around* a mouth through
+        # the shell behind it and surfacing elsewhere - measured on 16 of 139
+        # channels over a set of eight structures. An opening is therefore taken
+        # to be a mouth's inscribed ball rather than the single tetrahedron at
+        # its centre: a route that enters one has reached the surface there,
+        # whatever tetrahedron it happens to stand in.
+        opening_tree = None
+        opening_count = None
+        # A cavity with no mouth at all reports no channel, and the machinery
+        # below has nothing to build its trees from, so everything it guards is
+        # skipped rather than run on empty arrays.
+        has_mouths = bool(terminals_local)
+        if has_mouths:
+            mouth_local = np.asarray(terminals_local, dtype=np.intp)
+            mouth_xyz = vertices[cavity_tetra[mouth_local]]
+            mouth_radius = np.asarray(absorbing_radius, dtype=float)
+            # How many openings cover each tetrahedron. Queried once per mouth
+            # over a tree of the cavity's vertices, not once per tetrahedron:
+            # mouths are an order of magnitude fewer than tetrahedra, so this
+            # costs O(total marked) instead of a sweep over the whole cavity.
+            # A count rather than a flag because a seed can lie inside an opening
+            # itself, and each seed then takes its own openings back out of the
+            # mask - see the arrival test in the search below.
+            node_tree = _kdTree(vertices[cavity_tetra])
+            opening_count = np.zeros(len(cavity_tetra), dtype=np.int32)
+            for centre, radius in zip(mouth_xyz, mouth_radius):
+                hit = node_tree.query_ball_point(centre, radius)
+                if hit:
+                    opening_count[np.asarray(hit, dtype=np.intp)] += 1
+            # For the few arrival nodes, which mouths' balls cover them.
+            opening_tree = (_kdTree(mouth_xyz), mouth_xyz, mouth_radius,
+                            float(mouth_radius.max()))
+            # NOTE: the openings are deliberately *not* made absorbing in the
+            # search itself. Doing so was measured and is worse: Dijkstra then
+            # reroutes around every opening, discovers alternative interior
+            # corridors to regions it previously reached through one, and each of
+            # those becomes a new arrival - channel counts rise sharply. Leaving
+            # the graph alone and stopping only the *candidate* at the first
+            # arrival keeps the routes the search would have taken anyway.
+
+        def mouthsAt(node_local):
+            """Indices into ``mouth_local`` of the openings covering this node."""
+            tree, centres, radii, reach = opening_tree
+            here = vertices[cavity_tetra[node_local]]
+            near = tree.query_ball_point(here, reach)
+            if not near:
+                return frozenset()
+            near = np.asarray(near, dtype=np.intp)
+            covers = np.linalg.norm(centres[near] - here, axis=1) < radii[near]
+            return frozenset(int(k) for k in near[covers])
+
+        # (path_local, cost, arrival_local, opening, seed_index) per arrival.
+        opening_candidates = []
+        # Per seed, (start_local, distances, predecessors) of its search, so that
+        # _addOpeningChannels can read off the seed's own path to whichever mouth
+        # phase two settles on. See the note there.
+        seed_trees = []
         # Chamber links: the deep chamber of a cavity often has no way out of its
         # own, and reaches the surface only by joining a shallower chamber and
         # using that one's channels. Once every chamber is seeded, the dedup
@@ -7060,6 +7391,32 @@ class ChannelCalculator:
             if start_global not in global_to_local:
                 continue
             start_local = global_to_local[start_global]
+
+            # A seed can lie inside an opening itself: a mouth's ball reaches
+            # inward as well as outward, and on a wide mouth that is far enough
+            # to swallow the widest buried tetrahedron of a shallow pocket. Two
+            # things follow, and both are needed - with neither, every branch
+            # arrives at once at the root and the cavity reports nothing at all.
+            # The openings the seed already sits in are not this seed's arrival,
+            # so they come out of the mask; the route has to get somewhere else
+            # before it counts as having reached the surface. But the way out
+            # through them is still a channel - the shortest one there is - so
+            # the seed is emitted as an arrival in its own right below and phase
+            # two walks it to the cheapest of those mouths.
+            seed_openings = mouthsAt(start_local) if has_mouths else frozenset()
+            inside_opening = None
+            if has_mouths:
+                if seed_openings:
+                    own = np.zeros_like(opening_count)
+                    for k in seed_openings:
+                        hit = node_tree.query_ball_point(mouth_xyz[k],
+                                                         mouth_radius[k])
+                        if hit:
+                            own[np.asarray(hit, dtype=np.intp)] += 1
+                    inside_opening = (opening_count - own) > 0
+                else:
+                    inside_opening = opening_count > 0
+
             # directed=True: edge (u -> v) keeps weight l / (d_v**2 + b), i.e.
             # clearance of the node being *entered* - exactly the current heap
             # Dijkstra's cost model. (directed=False would symmetrize each edge 
@@ -7067,6 +7424,9 @@ class ChannelCalculator:
             distances, predecessors = dijkstra(
                 cavity_graph, directed=True, indices=start_local,
                 return_predecessors=True)
+            seed_index = len(seed_trees)
+            seed_trees.append((start_local, distances, predecessors,
+                               seed_openings))
             parent_to_children = defaultdict(list)
 
             for node, parent in enumerate(predecessors):
@@ -7093,55 +7453,57 @@ class ChannelCalculator:
                 return None, None
 
             paths = {}
-            stack = [(start_local, [start_local])]
+            arrivals = []
+            # `arrived` rides down the tree so that a route arrives once: the
+            # node where it *first* enters an opening. A local test - inside here
+            # and not inside at the parent - would fire again at every re-entry,
+            # and a long route crossing in and out of the surface region would
+            # spawn a candidate at each crossing rather than stopping at the
+            # first, which is the whole point.
+            stack = [(start_local, [start_local], False)]
             while stack:
-                node, path = stack.pop()
+                node, path, arrived = stack.pop()
                 paths[node] = path
+                if has_mouths and not arrived and inside_opening[node]:
+                    arrivals.append(node)
+                    arrived = True
                 for child in parent_to_children.get(node, []):
-                    stack.append((child, path + [child]))
+                    stack.append((child, path + [child], arrived))
 
-            # A channel ends where it first touches the surface, i.e. at whichever
-            # mouth absorbed it - so emit a candidate for every *reachable* mouth,
-            # not for a pre-sampled subset of them. Sampling the targets before the
-            # search (the old `end_tetrahedra`, thinned by `sparsity`) can pick a
-            # target that sits behind another mouth: the path is absorbed at that
-            # nearer mouth and can go no further, the sampled target is never
-            # reached, and because only sampled targets emit channels the tunnel is
-            # reported nowhere at all. Which mouth happens to shadow which target is
-            # a tessellation accident, so real tunnels vanished at some meshes and
-            # not others. Every mouth is a legitimate terminus, so let every
-            # reachable one produce a candidate and leave exit identity to the
+            # One candidate per *arrival*: the node where a route first enters an
+            # opening, collected during the walk above so that each branch
+            # contributes exactly one. The seed leads the list when it sits in an
+            # opening of its own, standing in for the way straight out through it;
+            # its route is the single node, and phase two supplies the whole of
+            # the path.
+            #
+            # Note what is NOT done here: thinning the mouths by `sparsity` before
+            # the search, as an earlier version did. That can pick a target
+            # sitting behind another mouth - the path is absorbed at the nearer
+            # one and never reaches the sampled target, so the tunnel is reported
+            # nowhere at all. Which mouth shadows which is a tessellation
+            # accident, so real tunnels vanished at some meshes and not others.
+            # Every mouth is a legitimate terminus; exit identity is left to the
             # dedup, where `sparsity` merges the mouths that share one opening.
-            for exit_local in terminals_local:
-                if exit_local == start_local:
-                    continue
-                if np.isinf(distances[exit_local]):
-                    continue
-
-                path_local = paths.get(exit_local)
+            for arrival in ([start_local] if seed_openings else []) + arrivals:
+                arrival = int(arrival)
+                path_local = paths.get(arrival)
                 if path_local is None:
                     continue
-
-                # A route that joins another chamber on its way out is not this
-                # chamber's channel: it is a link to that chamber followed by that
-                # chamber's own channel, and both halves are reported separately.
-                # Emitting it whole is what leaves long, narrow duplicates that
-                # run through one pocket to surface at another's mouth. The exit
-                # is not lost by dropping it - the chamber the route joined
-                # searches the same mouth from much closer.
                 if chamber_labels is not None:
                     joined_at, _ = firstForeignChamber(path_local)
                     if joined_at is not None:
                         continue
-
-                path_global = cavity_tetra[path_local]
-                channel = Channel(path_global, *self.processChannel(
-                    path_global, vertices, points, vdw_radii, simplices),
-                    cost=float(distances[path_local[-1]]))
-                # the Dijkstra cost at every node, so that a path cut short at a
-                # reported exit can be re-costed at the node it was cut at
-                node_costs = np.asarray(distances)[np.asarray(path_local)]
-                candidates.append((channel, node_costs))
+                # The seed's own openings are the seed's business alone: for any
+                # other arrival they are behind it, and letting one serve as the
+                # exit would send phase two back the way it came.
+                opening = (seed_openings if arrival == start_local
+                           else mouthsAt(arrival) - seed_openings)
+                if not opening:
+                    continue
+                opening_candidates.append((path_local,
+                                           float(distances[arrival]),
+                                           arrival, opening, seed_index))
 
             # One link per other seed reachable from this one, cut at the first
             # chamber the route joins. The cut chamber need not be the chamber of
@@ -7187,12 +7549,411 @@ class ChannelCalculator:
 
         # Channels first: a link is judged against the openings they report, so
         # they have to exist by the time the links are deduped.
-        openings = self._addDedupedChannels(cavity, candidates, similarity,
-                                            vertices, points, vdw_radii,
-                                            simplices)
-        self._addDedupedLinks(cavity, link_candidates, similarity, openings)
+        openings = np.empty((0, 3)), np.empty(0)
+        if has_mouths:
+            openings = self._addOpeningChannels(
+                cavity, opening_candidates, divergence, transit_graph,
+                cavity_tetra, vertices, points, vdw_radii, simplices,
+                mouth_local, mouth_xyz, mouth_radius, seed_trees)
+        self._addDedupedLinks(cavity, link_candidates, divergence, openings)
 
-    def _addDedupedLinks(self, cavity, candidates, similarity, openings=None):
+    def _exitImproves(self, home, candidate, seed_trees):
+        """Is ``candidate`` a better way out than the ``home`` already reported?
+
+        Both are routes the corridor test has already called one channel, so this
+        is not asking which corridor to keep but which of two endings to show for
+        it. A bare "is the mouth wider" rule is not enough on its own; the tests
+        below are what separates an exchange worth making from one that trades a
+        longer route for a number.
+
+        An exchange has to be an improvement in one of two ways, and may not be a
+        regression in either.
+
+        *Enabler: a wider mouth.* By at least ``min_gain``, because clearances a
+        few hundredths apart are one hole sampled by two tetrahedra, and buying
+        that costs a longer route for nothing.
+
+        *Enabler: a wider bottleneck.* The channel's own headline number, which a
+        mouth width can move without touching. It matters on exactly the channels
+        whose bottleneck *is* their exit - there, widening the mouth widens the
+        channel, and holding those to the mouth threshold would refuse a real
+        improvement over a few hundredths of an Angstrom.
+
+        *Guard: the bottleneck may never go backwards.* The two routes are
+        identical up to their fork, so a candidate whose bottleneck is lower must
+        be pinching within the stretch it adds - it is reaching a better exit by
+        threading a tighter gap than anything on the route it replaces.
+
+        *Guard: nor may the mouth, while the bottleneck is unchanged.* Only
+        while: the bottleneck is the tightest gate on the whole route, the
+        terminal one into the mouth included, so a narrower exit cannot be hiding
+        a tighter approach behind it - a neck just inside a wide mouth is a gate
+        like any other and is already in the number. Where the candidate is
+        genuinely wider at its tightest point, that is the passage improving, and
+        a wider mouth on the route being replaced buys nothing when its own pinch
+        lies upstream of it: the wide hole cannot be reached through the narrow
+        one. Where the bottleneck does not improve, the mouth is the only thing
+        left to compare and this guard is the whole of it. What the exchange may
+        still not do is bury the exit, which clearance cannot see and the
+        enclosure test below can.
+
+        *Not much dearer, measured on the tails.* Only what follows the fork is
+        being chosen; the shared head is common to both by construction. Charging
+        the difference against the whole cost would make the verdict depend on how
+        much identical prefix happens to precede the fork, so that one and the
+        same decision reads as a small increase on a long channel and a large one
+        on a short channel, and is refused only on the short one. The head is
+        discounted only when both routes come from one seed's tree and so really
+        do share it; otherwise the whole cost is compared, as before.
+
+        *Not the same ending continued.* Both routes are paths in one Dijkstra
+        tree, so they share a prefix and part at a fork. When the fork is at the
+        last node or two the candidate does not go anywhere else, it carries on
+        past the reported mouth and surfaces a little further out - which is the
+        thing ending a channel at its first opening exists to prevent, and is
+        refused on that ground rather than on any measurement.
+
+        *No more buried than what it replaces.* This is the test that catches what
+        clearance cannot. A wider mouth can sit deeper in a groove than the
+        narrower one beside it, and then the channel gains a number and loses its
+        ending. Burial is read at two scales because neither works alone - inside
+        a wide lumen the closer scale saturates near zero and stops
+        discriminating, while the further one misses a mouth that is pinched only
+        locally. A tolerance of one ray keeps the sampling's own quantum from
+        reading as a change."""
+        # Least widening of the mouth, in Angstrom, that enables an exchange on
+        # its own: above the width two tetrahedra sampling one hole differ by,
+        # below the width at which an exit is really a different one.
+        min_gain = 0.15
+        # How much dearer the candidate's tail may be than the tail it replaces.
+        max_tail_cost = 0.30
+        scales = (6.0, 8.0)          # Angstrom; see the paragraph on burial above
+        # How much of its own path a candidate must give up to be going somewhere
+        # else rather than continuing past the reported mouth.
+        min_fork = 1.0
+        rays = 32
+        eps = 1e-9
+
+        if candidate['bottleneck'] < home['bottleneck'] - eps:
+            return False
+        if (candidate['bottleneck'] <= home['bottleneck'] + eps
+                and candidate['clear'] < home['clear'] - eps):
+            return False
+        if not (candidate['clear'] >= home['clear'] + min_gain
+                or candidate['bottleneck'] > home['bottleneck'] + eps):
+            return False
+
+        kept, offered = home['path'], candidate['path']
+        shared = 0
+        while (shared < min(len(kept), len(offered))
+               and kept[shared] == offered[shared]):
+            shared += 1
+        fork = max(shared - 1, 0)
+
+        forsaken = home['route'][fork:]
+        if len(forsaken) < 2 or np.linalg.norm(
+                np.diff(forsaken, axis=0), axis=1).sum() < min_fork:
+            return False
+
+        head = 0.0
+        if (shared and home['seed'] == candidate['seed']
+                and home['from_tree'] and candidate['from_tree']):
+            head = float(seed_trees[home['seed']][1][kept[fork]])
+        if not (0.0 <= head < home['cost']):
+            head = 0.0               # a spliced route, or a degenerate prefix
+        if (candidate['cost'] - head > (home['cost'] - head)
+                * (1.0 + max_tail_cost)):
+            return False
+
+        coords, tree = self._enclosureAtoms()
+        pair = np.vstack((home['xyz'], candidate['xyz']))
+        for reach in scales:
+            here, there = self.calcEnclosure(pair, coords, tree=tree,
+                                             reach=reach, rays=rays)
+            if there > here + 1.0 / rays:
+                return False
+        return True
+
+    def _enclosureAtoms(self):
+        """The real atoms and a tree over them, built once and only if asked for.
+
+        Burial is a property of the protein, so this is the structure itself and
+        not the balls the tessellation was built on, which may be homogenized."""
+        if self._enclosure_atoms is None:
+            coords = getCoords(self.atoms)
+            self._enclosure_atoms = (coords, _kdTree(coords))
+        return self._enclosure_atoms
+
+    def _addOpeningChannels(self, cavity, candidates, divergence, cavity_graph,
+                            cavity_tetra, vertices, points, vdw_radii, simplices,
+                            mouth_local, mouth_xyz, mouth_radius, seed_trees):
+        """Deduplicate routes at the opening they arrive at, then carry the
+        survivors out through a mouth of that same opening.
+
+        Three questions, answered separately because they are separate.
+
+        *Which* channels exist is decided on the interior corridors, before the
+        routes fan out across the mouth - that fan is the splay
+        :meth:`_routeCoverage` has to discount when the comparison is made at the
+        exits instead, and comparing before it removes the need. Only routes whose
+        arrivals share a covering mouth are compared here; the rest meet later, at
+        their exits, where the ordinary opening-and-corridor test still runs.
+
+        *Which mouth* of that opening a survivor leaves by is the cheapest one
+        from the seed, among those its arrival can reach.
+
+        *What the channel looks like* is then the seed's own path to that mouth,
+        read off the search that is already done - not seed->arrival spliced onto
+        a fresh arrival->mouth search, whose two halves are each cheapest for
+        their own endpoints and meet at an angle wherever the mouth sits on
+        another branch of the tree. The splice remains as the fallback for the
+        two cases the tree cannot answer: a mouth the seed's search never reached,
+        being absorbed behind another, and a path to it that surfaces at some
+        different opening on the way.
+
+        Deduplicating before all of this is what keeps the arrival search cheap:
+        one per reported channel rather than one per arrival, which on a large
+        structure is the difference between tens and hundreds of searches."""
+
+        from scipy.sparse.csgraph import dijkstra as sparse_dijkstra
+
+        mouth_tree = _kdTree(mouth_xyz)
+        mouth_reach = float(mouth_radius.max()) if len(mouth_radius) else 0.0
+
+        def coveringMouths(node_local):
+            """Indices into ``mouth_local`` of the openings covering this node."""
+            here = vertices[cavity_tetra[node_local]]
+            near = mouth_tree.query_ball_point(here, mouth_reach)
+            if not near:
+                return frozenset()
+            near = np.asarray(near, dtype=np.intp)
+            covers = np.linalg.norm(mouth_xyz[near] - here,
+                                    axis=1) < mouth_radius[near]
+            return frozenset(int(k) for k in near[covers])
+
+        def surfacesElsewhere(route_local, seed_openings):
+            """Does this route leave by an opening other than the one it first
+            reached?
+
+            The seed's path to a mouth is the cheapest one, but nothing stops it
+            crossing a different opening on the way - which is the very leak the
+            arrival test exists to close, surfacing at one opening and leaving by
+            another. The test is the one the whole design is judged by: the
+            opening a route first enters must be the opening it ends in.
+            Neighbouring openings overlap, so this asks whether the two sets of
+            mouths meet, not whether they are the same. Openings the seed already
+            sits in do not count - the route starts inside those, and has not
+            gone anywhere by being there."""
+            exits_in = coveringMouths(int(route_local[-1]))
+            for node in route_local[:-1]:
+                here = coveringMouths(int(node)) - seed_openings
+                if here:
+                    return not (here & exits_in)
+            return False
+
+        kept = []    # (route, clearance, opening, path_local, arrival, cost,
+                     #  seed_index)
+        for path_local, cost, arrival, opening, seed in sorted(
+                candidates, key=lambda c: c[1]):
+            route = vertices[cavity_tetra[path_local]]
+            route_clear = self._vertex_clearance[cavity_tetra[path_local]]
+            duplicate = False
+            for kept_route, kept_clear, kept_opening, _p, _a, _c, _s in kept:
+                # Two routes share an opening when the balls covering their
+                # arrivals overlap at all. Mouth circumcenters sit a fraction of
+                # an Angstrom apart, so one opening is sampled by many nearly
+                # coincident tetrahedra, and asking whether two routes reached the
+                # *same* one is a question the tessellation answers arbitrarily;
+                # asking whether their covering sets meet is stable.
+                if not (opening & kept_opening):
+                    continue
+                # No opening discount here: these routes stop at the opening, so
+                # the splay the discount exists for has not happened yet.
+                if self._routeDivergence(route, kept_route, route_clear,
+                                         kept_clear) <= divergence:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append((route, route_clear, opening, path_local, arrival,
+                             cost, seed))
+
+        centres = np.empty((0, 3))
+        radii = np.empty(0)
+        extended = []               # (cost, channel, route, xyz, radius, clear)
+        reported = []               # one dict per channel kept, see below
+        if not kept:
+            return centres, radii
+
+        # Phase two, batched over the survivors: the cheapest way out of each
+        # one's opening, costed from its arrival rather than from the seed. The
+        # distance from the seed would pick whichever mouth is cheapest to reach
+        # overall, by a path that need not pass through this arrival at all.
+        sources = [arrival for _r, _rc, _o, _p, arrival, _c, _s in kept]
+        distances, predecessors = sparse_dijkstra(
+            cavity_graph, directed=True, indices=sources,
+            return_predecessors=True)
+        distances = np.atleast_2d(distances)
+        predecessors = np.atleast_2d(predecessors)
+
+        for i, (_route, _clear, opening, path_local, arrival, cost, seed) in \
+                enumerate(kept):
+            reachable = [k for k in sorted(opening)
+                         if np.isfinite(distances[i][mouth_local[k]])]
+            path_full = np.asarray(path_local, dtype=np.intp)
+            exit_k = None
+            # Whether the reported route is the seed's own tree path. Only then
+            # do two routes of one seed share a prefix whose cost is the same for
+            # both, which is what _exitImproves discounts before comparing them.
+            from_tree = False
+            if reachable:
+                # The route reported is the SEED's own path to the mouth, not
+                # seed->arrival spliced onto a fresh arrival->mouth search. Each
+                # half of such a splice is cheapest for its own endpoints, and
+                # where the chosen mouth sits on a different branch of the seed's
+                # tree the two meet at an angle: measured a 92 degree turn that
+                # added 17% to a channel's length and 0.20 to its curvature,
+                # against a straight path to the same exit the tree already held.
+                # The arrival settles *which* opening a channel may end at, and
+                # is where routes are deduplicated; it is not a waypoint the
+                # geometry has to pass through.
+                #
+                # Which mouth of that opening is therefore chosen on the seed's
+                # cost too. Choosing on the arrival's cost picks a mouth that is
+                # cheap to reach from the arrival and then reports a route that
+                # was never optimised for it, so the channel wanders where a
+                # straighter one to a neighbouring mouth of the same opening
+                # existed. The candidates stay gated on being reachable from the
+                # arrival: that is what makes them mouths this route can leave
+                # by at all.
+                (start_local, seed_distances, seed_predecessors,
+                 seed_openings) = seed_trees[seed]
+                from_seed = [k for k in reachable
+                             if np.isfinite(seed_distances[mouth_local[k]])]
+                route_local = []
+                if from_seed:
+                    exit_k = min(from_seed,
+                                 key=lambda k: seed_distances[mouth_local[k]])
+                    walk = self._tracePath(seed_predecessors, start_local,
+                                           int(mouth_local[exit_k]))
+                    # Only if it does not surface somewhere else on the way: the
+                    # cheapest path to a mouth is free to cross a neighbouring
+                    # opening, and taking it then would reinstate exactly the
+                    # leak this whole search exists to close.
+                    if len(walk) > 1 and not surfacesElsewhere(
+                            walk, seed_openings):
+                        route_local = walk
+                if route_local:
+                    path_full = np.asarray(route_local, dtype=np.intp)
+                    cost = float(seed_distances[int(mouth_local[exit_k])])
+                    from_tree = True
+                else:
+                    # Either the seed's search never reached a mouth of this
+                    # opening (all of them absorbed behind another), or its path
+                    # to the cheapest one surfaces elsewhere first. Fall back on
+                    # the splice, whose second half starts at the arrival and so
+                    # cannot surface before it.
+                    exit_k = min(reachable,
+                                 key=lambda k: distances[i][mouth_local[k]])
+                    tail = self._tracePath(predecessors[i], arrival,
+                                           int(mouth_local[exit_k]))
+                    if len(tail) > 1:
+                        path_full = np.concatenate(
+                            [path_full, np.asarray(tail[1:], dtype=np.intp)])
+                        cost = cost + float(distances[i][mouth_local[exit_k]])
+                    else:
+                        exit_k = None
+            # exit_k stays None when the opening covers this node but none of its
+            # mouths can be walked to, every route there being absorbed first. The
+            # channel is then reported as it stands, at the arrival - unless that
+            # leaves nothing to report, which happens for a seed that sits in an
+            # opening whose mouths are all unreachable: its route is the seed
+            # alone, and a one-tetrahedron channel has no centerline.
+            if len(path_full) < 2:
+                continue
+
+            path_global = cavity_tetra[path_full]
+            channel = Channel(path_global, *self.processChannel(
+                path_global, vertices, points, vdw_radii, simplices),
+                cost=float(cost))
+            exit_xyz = vertices[path_global[-1]]
+            exit_radius = max(float(mouth_radius[exit_k]), self.sparsity / 2.0) \
+                if exit_k is not None else self.sparsity / 2.0
+            # The mouth's own clearance as well as the sphere it registers: the
+            # sphere carries the sparsity floor, so it cannot say which of two
+            # exits is the wider hole.
+            exit_clear = float(mouth_radius[exit_k]) if exit_k is not None \
+                else 0.0
+            extended.append(dict(
+                cost=float(cost), channel=channel, route=vertices[path_global],
+                route_clear=self._vertex_clearance[path_global],
+                xyz=exit_xyz, radius=exit_radius, clear=exit_clear,
+                bottleneck=float(channel.bottleneck), path=path_full,
+                seed=seed, from_tree=from_tree))
+
+        # Second pass, on the finished channels: the arrival test above settles
+        # only whether two routes came out of the *same* opening, which is a much
+        # narrower question than `sparsity` asks. Two arrivals a few Angstrom
+        # apart have disjoint mouth sets and are never compared there, yet
+        # `sparsity` may well call their openings one. So the ordinary
+        # opening-and-corridor identity still runs, now on exits that are
+        # guaranteed to lie in the opening the route actually reached.
+        # A duplicate is not simply dropped: if _exitImproves finds it a better
+        # way out, it becomes the one reported. Two routes that the corridor test
+        # calls the same channel can still end at very different mouths -
+        # measured 2.30 A against 4.16 A on a 0.9% cost difference - and cost,
+        # which is dominated by the interior, is close to blind to the difference.
+        for offer in sorted(extended, key=lambda c: c['cost']):
+            route, exit_xyz = offer['route'], offer['xyz']
+            home = None
+            for entry in reported:
+                kept_xyz, kept_radius = entry['xyz'], entry['radius']
+                if np.linalg.norm(exit_xyz - kept_xyz) >= (kept_radius
+                                                           + offer['radius']):
+                    continue
+                # No opening discount, unlike the one-pass dedup. That discount
+                # exists to stop the fan two routes make as they splay across a
+                # shared mouth from reading as divergence, and that fan has
+                # already been settled at the arrival, where the routes were
+                # compared before they reached a mouth at all. Applying it again
+                # here would discount the very stretch that tells apart two
+                # corridors arriving at neighbouring openings.
+                if self._routeDivergence(route, entry['route'],
+                                         offer['route_clear'],
+                                         entry['route_clear']) <= divergence:
+                    home = entry
+                    break
+            if home is None:
+                reported.append(offer)
+            elif self._exitImproves(home, offer, seed_trees):
+                founding_cost = home['cost']
+                home.update(offer)
+                # The founder's cost stays, so every later candidate is judged
+                # against the cheapest route into this opening and the tolerance
+                # cannot ratchet upwards through a chain of exchanges.
+                home['cost'] = founding_cost
+
+        # Added only now, so that an exchange replaces a representative rather
+        # than leaving the superseded channel in the cavity. The list is still in
+        # cost order, which is the order the channels are numbered in.
+        for entry in reported:
+            cavity.addChannel(entry['channel'])
+            centres = np.vstack((centres, entry['xyz']))
+            radii = np.append(radii, entry['radius'])
+        return centres, radii
+
+    def _tracePath(self, predecessors, source, target):
+        """Local indices along ``source`` -> ``target`` in a predecessor array."""
+        path = [int(target)]
+        node = int(target)
+        while node != int(source):
+            node = int(predecessors[node])
+            if node < 0:
+                return []
+            path.append(node)
+        path.reverse()
+        return path
+
+    def _addDedupedLinks(self, cavity, candidates, divergence, openings=None):
         """Keep one link per (chamber joined, corridor taken), cheapest first.
 
         The same two-part identity the channels use, with the chamber standing in
@@ -7202,10 +7963,10 @@ class ChannelCalculator:
         first, and each candidate judged only against what is already kept, so
         the result does not depend on the order the seeds were searched in.
 
-        A link that runs through a reported opening is dropped first. That is the
-        same test :meth:`_addDedupedChannels` makes in its step 1 - a route
-        passing through the exit sphere of a reported channel has left the
-        protein there - and links were the one object never held to it, the
+        A link that runs through a reported opening is dropped first, on the same
+        ground the channels themselves are held to - a route passing through the
+        exit sphere of a reported channel has left the protein there - and links
+        were the one object never held to it, the
         chamber cut having been assumed to stop them soon enough. It does not: a
         route aimed at another seed has no reason to enter a mouth, so absorption
         never fires, and it steps around one through a neighbouring tetrahedron
@@ -7215,209 +7976,122 @@ class ChannelCalculator:
         link is dropped outright: what came before is the seed's route to the
         surface, which is a channel, and is already reported as one."""
 
-        kept = []                                   # (points, chamber joined)
+        kept = []                     # (points, clearance, chamber joined)
         centres, radii = openings if openings is not None else (None, None)
         for link, joined in sorted(candidates, key=lambda c: c[0].cost):
             points_on_route = np.asarray(link.centerline_spline(
+                link.centerline_spline.x))
+            # The radius profile shares the centerline's parameter, so reading it
+            # at the same knots gives the clearance at each of those points.
+            clear_on_route = np.asarray(link.radius_spline(
                 link.centerline_spline.x))
             if centres is not None and len(centres):
                 if (np.linalg.norm(points_on_route[:, None, :] - centres,
                                    axis=2) < radii).any():
                     continue
             duplicate = False
-            for kept_points, kept_chamber in kept:
+            for kept_points, kept_clear, kept_chamber in kept:
                 if kept_chamber != joined:
                     continue
-                if self._routeCoverage(points_on_route,
-                                       kept_points) >= similarity:
+                if self._routeDivergence(points_on_route, kept_points,
+                                         clear_on_route,
+                                         kept_clear) <= divergence:
                     duplicate = True
                     break
             if not duplicate:
-                kept.append((points_on_route, joined))
+                kept.append((points_on_route, clear_on_route, joined))
                 cavity.addLink(link)
 
-    def _addDedupedChannels(self, cavity, candidates, similarity, vertices,
-                            points, vdw_radii, simplices):
-        # Cheapest first, and each candidate is judged only against the channels
-        # already kept - so the kept channel is always the cheapest of its group
-        # and the result does not depend on the order candidates arrive in.
-        #
-        # Step 1, CUT. A reported channel's exit sphere (centred on its exit
-        # vertex, radius the clearance there) is the volume of that opening. If a
-        # candidate's route passes through it, the candidate has left the protein
-        # at that opening: whatever it does afterwards is a hop across the outside,
-        # not part of a tunnel. So cut it there. This is what stops a path from
-        # slipping past a mouth through a twin tetrahedron and claiming some far
-        # exit on the other side. Note the cut is made only against the handful of
-        # *already reported* exits, never against all mouths - truncating against
-        # every mouth is what used to demolish real tunnels.
-        #
-        # Step 2, COMPARE. Two channels are the same tunnel when they leave by the
-        # same opening AND take the same corridor to get there. Both halves are
-        # needed: a corridor that forks near the surface and exits twice through
-        # one opening is one tunnel counted twice (merge), but two genuinely
-        # different corridors that happen to surface at the same opening are two
-        # tunnels (keep), and one corridor reaching two separate openings is also
-        # two tunnels (keep). A candidate that was cut in step 1 is compared on its
-        # cut route, which is the only part of it that is really a tunnel.
-        #
-        # Route identity is measured GEOMETRICALLY - how much of one centerline
-        # runs alongside the other - not as a shared prefix of tetrahedra. A prefix
-        # is the wrong instrument twice over: it is blind to rejoining (two routes
-        # that split near the seed and then run together to the same exit share
-        # almost no prefix, yet are plainly one tunnel) and it is fooled by
-        # containment (a short route that is a prefix of a long one scores ~1.0 and
-        # deletes the long one, which is the channel carrying the distinctive
-        # route). Comparing the curves is immune to both, and to the tessellation:
-        # a tetrahedron count is not mesh-invariant, so the same physical fork
-        # scores differently at different max_deviation.
-        prepared = sorted(candidates, key=lambda c: c[0].cost)
-        if not prepared:
-            return np.empty((0, 3)), np.empty(0)
+    def _routeDivergence(self, a, b, ra, rb):
+        """How far two routes part company, per Angstrom of corridor they share.
 
-        kept = []  # (channel, pts, exit_xyz, opening_radius)
-        # The opening centres and radii of `kept`, carried as arrays so that step
-        # 1 can test a candidate against every reported opening at once. Grown on
-        # append instead of rebuilt per candidate: `kept` gains at most one entry
-        # per candidate, so rebuilding would put an O(len(kept)) Python pass back
-        # into the hot loop and cost more than it saves on a small `kept`.
-        centres = np.empty((0, 3))
-        radii = np.empty(0)
-        for channel, node_costs in prepared:
-            tetra = np.asarray(channel.tetrahedra)
-            pts = vertices[tetra]
+        ``ra`` and ``rb`` are the clearances along ``a`` and ``b`` - the radius
+        of a ball centred on the centerline that holds no atom - so each route
+        is a tube, and the question asked at every vertex is how far the two
+        tube *surfaces* are apart::
 
-            # step 1: cut at the first reported opening this route enters.
-            # One (nodes x openings) distance test instead of the former Python
-            # double loop: np.argmax over the boolean rows returns the first
-            # True, so the node picked is the first one inside any opening and
-            # the cutter is the first opening in `kept` order that contains it -
-            # the same two `break`s the loop used to take. Multi-seeding pools
-            # every seed's candidates into this one pass, and the loop was its
-            # cost centre (measured 238s versus 6s single-seed on 1tqn).
-            cut, cutter = None, None
-            if kept:
-                inside = np.linalg.norm(pts[1:, None, :] - centres,
-                                        axis=2) < radii
-                entered = inside.any(axis=1)
-                if entered.any():
-                    row = int(np.argmax(entered))
-                    cut = row + 1
-                    cutter = kept[int(np.argmax(inside[row]))]
-            if cut is not None:
-                tetra = tetra[:cut + 1]
-                pts = pts[:cut + 1]
-                channel = Channel(tetra, *self.processChannel(
-                    tetra, vertices, points, vdw_radii, simplices),
-                    cost=float(node_costs[cut]))
+            g = |x - nearest vertex of the other route| - (r_here + r_there)
 
-            # step 2: same opening AND same corridor -> the same tunnel.
-            # The corridor is compared OUTSIDE the shared opening. Inside it the
-            # routes are already through the mouth and merely fanning out across
-            # it, and that fan is not evidence of a different corridor: the
-            # Voronoi network splays where a tunnel widens into its opening, so
-            # sibling paths peel off in the last few Angstrom and end on
-            # neighbouring exit tetrahedra. Counting that splay as divergence is
-            # what used to report one tunnel as a bundle of near-copies.
-            duplicate = False
-            for _kc, kpts, kxyz, kr in kept:
-                if np.linalg.norm(pts[-1] - kxyz) >= kr:
-                    continue                        # a different opening
-                if self._routeCoverage(pts, kpts, center=kxyz,
-                                       radius=kr) >= similarity:
-                    duplicate = True
-                    break
-            if not duplicate:
-                if cut is not None:
-                    # A cut channel stops inside an opening that is already
-                    # reported, so it INHERITS that opening rather than declaring
-                    # its own. Its last tetrahedron is an interior one that merely
-                    # happens to lie in the exit volume, and its inscribed sphere
-                    # is not a mouth - promoting it to a cutting surface would let
-                    # an interior sphere start truncating other candidates. (It
-                    # survives to here only when it reached that opening by a
-                    # genuinely different corridor, which is a distinct tunnel and
-                    # must be kept. Note its cost, taken at the cut node, is
-                    # necessarily below that of the channel that cut it, since the
-                    # cut lies upstream of that channel's mouth - so cost orders
-                    # the output but does not mean the cut channel is "better".)
-                    opening_xyz, opening_radius = cutter[2], cutter[3]
-                else:
-                    # One radius stands for this opening everywhere: it cuts routes
-                    # that pass through it, it decides which channels share it, and
-                    # it is the region discounted when their corridors are compared.
-                    # The clearance at the exit vertex measures the mouth, but on a
-                    # coarse tessellation it is erratic and can collapse to almost
-                    # nothing, fragmenting one physical mouth into several; the
-                    # sparsity floor keeps it mesh-independent.
-                    opening_xyz = pts[-1]
-                    opening_radius = max(self.calculateMaxRadius(
-                        pts[-1], points, vdw_radii,
-                        simplices[tetra[-1]]), self.sparsity)
-                kept.append((channel, pts, opening_xyz, opening_radius))
-                centres = np.vstack((centres, opening_xyz))
-                radii = np.append(radii, opening_radius)
-        for channel, _pts, _xyz, _r in kept:
-            cavity.addChannel(channel)
-        # The openings this cavity reports, handed on so that the links can be
-        # held to the same rule as the candidates were in step 1.
-        return centres, radii
+        Negative means the tubes overlap there: the two balls share a point,
+        both are free of atoms, and a path from one centerline to the other runs
+        through free space, so no wall separates them. Positive is the width of
+        the gap between them. Both routes are measured, each against the other,
+        and every vertex is weighted by the arc length it stands for. The result
+        is the divergence integral per Angstrom of channel::
 
-    def _routeCoverage(self, a, b, tol=None, center=None, radius=0.0):
-        """Fraction of the SHORTER centerline's arc length that runs within ``tol``
-        Angstrom of the longer one.
+            I = sum of max(0, g) * weight              how far, times how long
+            L = (length of a + length of b) / 2        the average channel
+            return I / L                               Angstrom
 
-        Answers "does the longer channel follow the shorter one's corridor?".
-        ``1.0`` means the shorter route lies wholly inside the longer one's
-        corridor, so they took the same way out - the longer one simply carried on
-        past the point where the shorter one surfaced. That continuation is *not*
-        counted as a difference, which is the point: two channels leaving through
-        one opening are one tunnel even if one of them runs on and exits a few
-        Angstrom further along. It is safe to ignore the continuation only because
-        this is gated on the two channels sharing an opening; without that gate,
-        scoring against the shorter route would delete long channels that head off
-        to a quite different exit.
+        Two things have to enter the answer and neither is enough alone. *How
+        far* apart they get says nothing about whether it is a brief excursion
+        or a parting of the ways; *how much* of the route diverges says nothing
+        about whether it strays by half an Angstrom or by eight. The integral
+        holds both, and dividing by the length is what makes a two Angstrom arm
+        off a ninety Angstrom trunk read differently from the same arm off a ten
+        Angstrom one.
 
-        ``center`` and ``radius`` describe that shared opening, and the part of
-        either route lying inside it is discarded before the comparison. A tunnel
-        splays as it widens into its mouth, so sibling paths peel apart over the
-        last few Angstrom and land on neighbouring exit tetrahedra; that fan says
-        nothing about which corridor they took, and counting it makes one tunnel
-        look like several.
+        Scaling by the clearance rather than by a fixed distance is what lets one
+        number serve everywhere: the question has no absolute scale, since two
+        paths a couple of Angstrom apart in a wide chamber have nothing between
+        them while the same distance in a narrow throat spans a wall.
 
-        Note this deliberately says nothing about *where* the routes differ, or how
-        sharply the uncovered part turns away - only how much of the shorter route
-        is shared. Where two corridors genuinely part company, they do so for a
-        large fraction of the route, and the score falls."""
-        if tol is None:
-            tol = self.route_tolerance
-        if center is not None and radius > 0:
-            a = a[np.linalg.norm(a - center, axis=1) > radius]
-            b = b[np.linalg.norm(b - center, axis=1) > radius]
-            if len(a) < 2 or len(b) < 2:
-                # Nothing survives outside the opening, so all either route ever
-                # did was cross the mouth: there is no corridor to tell apart.
-                return 1.0
+        Both routes are measured, rather than only the shorter one against the
+        longer, because a route that carries on past where the other ended is
+        the whole difference between them in the contained case - and the far
+        stretch then registers exactly as much as it deserves: a continuation
+        that stays inside the tube it came from contributes nothing, while one
+        that leaves contributes its full length.
+
+        Three limits worth knowing, all of them in the pairing rather than the
+        formula. The nearest vertex of the other route is not a correspondence:
+        where two routes fork, the fork stays the nearest point on the other
+        one, so a diverging tail is measured against the fork rather than
+        against anything it runs beside. The clearance grows towards a mouth, so
+        the reach grows exactly where sibling routes fan out, and a divergence
+        there can go unseen from one side - measured 7.2 Angstrom of separation
+        still reading as touching tubes, caught only because the other route's
+        arm registered from its own side. And a pair whose routes both fork into
+        wide mouths could therefore be under-reported from both sides at once."""
+
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        ra = np.asarray(ra, dtype=float)
+        rb = np.asarray(rb, dtype=float)
+
+        def gaps(here, r_here, there, r_there):
+            """Surface gap at each vertex of ``here``, and its arc weight."""
+            distance, nearest = _kdTree(there).query(here)
+            gap = distance - (r_here + r_there[nearest])
+            steps = np.linalg.norm(np.diff(here, axis=0), axis=1)
+            weight = np.zeros(len(here))
+            weight[:-1] += steps / 2.0
+            weight[1:] += steps / 2.0
+            return gap, weight
+
         if len(a) < 2 or len(b) < 2:
-            return 0.0
+            # A route of one tetrahedron has no arc length to weigh, so the
+            # integral is undefined - but the question still has an answer: is
+            # that point inside the other's tube or outside it?
+            point, r_point, other, r_other = (a, ra, b, rb) if len(a) < 2 \
+                else (b, rb, a, ra)
+            if not len(point) or len(other) < 1:
+                return float('inf')
+            distance, nearest = _kdTree(other).query(point)
+            inside = (distance - (r_point + r_other[nearest])) <= 0
+            return 0.0 if bool(np.all(inside)) else float('inf')
 
-        def arclen(p):
-            return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+        gap_a, weight_a = gaps(a, ra, b, rb)
+        gap_b, weight_b = gaps(b, rb, a, ra)
+        gap = np.concatenate((gap_a, gap_b))
+        weight = np.concatenate((weight_a, weight_b))
 
-        long_p, short_p = (a, b) if arclen(a) >= arclen(b) else (b, a)
-        steps = np.linalg.norm(np.diff(short_p, axis=0), axis=1)
-        total = steps.sum()
-        if total <= 0:
-            return 0.0
-
-        # each node carries half of each adjacent segment, so its weight is the
-        # arc length it stands for
-        weight = np.zeros(len(short_p))
-        weight[:-1] += steps / 2.0
-        weight[1:] += steps / 2.0
-
-        near = _kdTree(long_p).query(short_p)[0] <= tol
-        return float(weight[near].sum() / total)
+        # Each route's weights sum to its own arc length, so the two together
+        # are the total and half of that is the average channel.
+        span = float(weight.sum()) / 2.0
+        if span <= 0:
+            return float('inf')
+        return float((np.maximum(gap, 0.0) * weight).sum() / span)
 
     def calculateMaxRadius(self, vertice, points, vdw_radii, simp):
         atom_positions = points[simp]
@@ -7471,90 +8145,91 @@ class ChannelCalculator:
                                 vdw_radii, simp, radii)
         return radii, gates
 
-    def processChannel(self, tetrahedra, voronoi_vertices, points, vdw_radii, 
+    def processChannel(self, tetrahedra, voronoi_vertices, points, vdw_radii,
                        simp):
-        from scipy.interpolate import CubicSpline
-        
+        """The geometry of one route: ``(centerline_spline, radius_spline,
+        length, bottleneck, volume)``.
+
+        The centerline runs through the circumcenters of ``tetrahedra`` and the
+        radius profile through their clearances and the gates between them, over
+        one shared parameter domain - so a value of the parameter names the same
+        place on both, and the endpoints (hence the cap radii) are the route's
+        own ends. The parameter measures distance, not tetrahedra; see the
+        comments below for why, and what it costs to get that wrong.
+
+        ``length`` and ``volume`` are the centerline's arc length and the volume
+        of the tube it sweeps; ``bottleneck`` is the tightest gate, taken from
+        the measurements rather than from the interpolated profile."""
+
+        from scipy.interpolate import CubicSpline, PchipInterpolator
+
         centers = voronoi_vertices[tetrahedra]
         radii, gates = self.calculateRadiusSpline(tetrahedra,
                                                   voronoi_vertices,
                                                   points, vdw_radii, simp)
         bottleneck = float(np.min(gates)) if len(gates) else float(np.min(radii))
 
-        t = np.arange(len(centers))
-        centerline_spline = CubicSpline(t, centers, bc_type='natural')
-        # The tube pinches at the gates, not at the wide circumcenters, so give
-        # the radius profile a knot at each gate (midway between its two
-        # vertices) carrying the gate clearance. The centerline keeps only the
-        # vertex knots; both splines share the same t domain, so the volume
-        # integral samples them consistently and the endpoints (hence the cap
-        # radii) are unchanged.
-        if len(gates):
-            knot_t = np.empty(2 * len(centers) - 1)
-            knot_t[0::2] = t
-            knot_t[1::2] = t[:-1] + 0.5
-            knot_r = np.empty_like(knot_t)
-            knot_r[0::2] = radii
-            knot_r[1::2] = gates
-            radius_spline = CubicSpline(knot_t, knot_r, bc_type='natural')
+        # Coincident circumcenters - the twin tetrahedra _edgeBottleneck guards
+        # against - are a repeated knot to a spline, and a parameter that
+        # advances by distance would stand still at one. Collapse each run of
+        # them onto its first point, at the same 1e-6 A separation that test
+        # uses. Nothing is lost: the gate of a collapsed span is taken as the
+        # tightest of the edges it covers, and the bottleneck above is over
+        # every edge in any case.
+        keep = [0]
+        for i in range(1, len(centers)):
+            if np.linalg.norm(centers[i] - centers[keep[-1]]) > 1e-6:
+                keep.append(i)
+        # The spline parameter advances by sqrt(step) - the centripetal
+        # parameterization - rather than by one per tetrahedron. Circumcenters
+        # are spaced anything but evenly along a route: neighbouring steps of
+        # 0.1 and 3.7 A occur, and giving each of them one unit of parameter
+        # makes the cubic overshoot the long edge and swing back, a bend the
+        # route does not have. Measured over a set of proteins, the index
+        # parameterization runs 6-8% (up to 22%) longer than the polyline
+        # through the same circumcenters and wanders up to 0.6 A off it, so it
+        # inflates every reported length, volume and curvature; centripetal
+        # stays within 1% and roughly halves the wander. Plain chord length
+        # fixes the length but wanders further still at abrupt turns, which is
+        # the familiar Catmull-Rom result and holds here as well.
+        if len(keep) < 2:
+            # every circumcenter of the route sits in one place, so there is no
+            # distance to parameterize by; fall back on the index.
+            keep = np.arange(len(centers), dtype=np.intp)
+            t = keep.astype(float)
         else:
-            radius_spline = CubicSpline(t, radii, bc_type='natural')
+            keep = np.asarray(keep, dtype=np.intp)
+            step = np.linalg.norm(np.diff(centers[keep], axis=0), axis=1)
+            t = np.concatenate([[0.0], np.cumsum(np.sqrt(step))])
+        centerline_spline = CubicSpline(t, centers[keep], bc_type='natural')
+        # The tube pinches at the gates, not at the wide circumcenters, so give
+        # the radius profile a knot at each gate (at the parameter midpoint
+        # between its two vertices) carrying the gate clearance. The centerline
+        # keeps only the vertex knots; both splines share the same t domain, so
+        # the volume integral samples them consistently and the endpoints (hence
+        # the cap radii) are unchanged.
+        # Shape-preserving (PCHIP) rather than a cubic spline: the profile is a
+        # sequence of measured clearances, and an interpolant that overshoots
+        # them writes spheres narrower than the bottleneck it reports - measured
+        # at up to 0.14 A below, and 0.18 A above the widest gate. PCHIP is
+        # monotone between knots, so the sampled tube is bounded by the numbers
+        # the knots carry.
+        if len(gates):
+            knot_t = np.empty(2 * len(keep) - 1)
+            knot_t[0::2] = t
+            knot_t[1::2] = 0.5 * (t[:-1] + t[1:])
+            knot_r = np.empty_like(knot_t)
+            knot_r[0::2] = radii[keep]
+            knot_r[1::2] = [float(gates[keep[k]:keep[k + 1]].min())
+                            for k in range(len(keep) - 1)]
+            radius_spline = PchipInterpolator(knot_t, knot_r)
+        else:
+            radius_spline = PchipInterpolator(t, radii[keep])
 
         length = self.calculateChannelLength(centerline_spline)
         volume = self.calculateChannelVolume(centerline_spline, radius_spline)
         
         return centerline_spline, radius_spline, length, bottleneck, volume
-
-    def findBiggestTetrahedron(self, tetrahedra, voronoi_vertices, points, 
-                               vdw_radii, simp):
-        radii = np.array([self.calculateMaxRadius(voronoi_vertices[tetra], points, vdw_radii, simp[tetra]) for tetra in tetrahedra])
-        max_radius_index = np.argmax(radii)
-        return tetrahedra[max_radius_index]
-
-    def getEndTetrahedra(self, tetrahedra, voronoi_vertices, points, vdw_radii, 
-                         simp, sparsity):
-        # Greedy sparse sampling of the mouth (exit) tetrahedra: seed with the
-        # widest tetrahedron, then repeatedly add the widest tetrahedron that is
-        # still at least `sparsity` away from every already-selected one, until
-        # none qualify. Vectorized rewrite of the former O(N_exit x M^2) double
-        # loop (which called np.linalg.norm once per candidate/selected pair and
-        # re-scanned radii via findBiggestTetrahedron every pass):
-        #   * the "far enough from all selected" test is exactly "running min
-        #     distance to the selected set >= sparsity", so keep one min_dist
-        #     array and fold in each new pick with a single vectorized norm;
-        #   * inscribed radii are geometry-only, so precompute them once instead
-        #     of recomputing find_biggest over the shrinking candidate set.
-        # Selection order and argmax first-tie-break match the original, so the
-        # returned end tetrahedra are identical.
-        tetrahedra = np.asarray(tetrahedra)
-        n = len(tetrahedra)
-        if n == 0:
-            return tetrahedra
-
-        verts = voronoi_vertices[tetrahedra]            # (n, 3) circumcenters
-        radii = np.array([
-            self.calculateMaxRadius(voronoi_vertices[tetra], points, 
-                                    vdw_radii, simp[tetra])
-            for tetra in tetrahedra])
-
-        min_dist = np.full(n, np.inf)
-        selected = np.zeros(n, dtype=bool)
-        order = []
-
-        current = int(np.argmax(radii))             # widest tetrahedron (seed)
-        while True:
-            order.append(current)
-            selected[current] = True
-            min_dist = np.minimum(min_dist, np.linalg.norm(verts - verts[current], axis=1))
-
-            feasible = (min_dist >= sparsity) & ~selected   # >= sparsity from every pick
-            if not feasible.any():
-                break
-            # widest feasible tetrahedron; np.argmax breaks ties toward the
-            # lowest index, matching the original input-order scan.
-            current = int(np.argmax(np.where(feasible, radii, -np.inf)))
-
-        return tetrahedra[order]
 
     def filterCavities(self, cavities, min_depth):
         return [cavity for cavity in cavities if cavity.depth >= min_depth]
@@ -7646,7 +8321,7 @@ class ChannelCalculator:
 
     @staticmethod
     def _channelRecords(channel_index, channel, atom_index, num_samples,
-                        label='channel'):
+                        label='channel', name_sites=True):
         """The FIL records of one channel: its REMARK, one ATOM per sampled
         sphere and the CONECT bonds between them.
 
@@ -7657,7 +8332,8 @@ class ChannelCalculator:
 
         # Each channel gets its own residue number so the channels stay
         # separable at the record level, matching saveCavitiesToPdb.
-        lines = [ChannelCalculator._channelRemark(channel_index, channel, label)]
+        lines = [ChannelCalculator._channelRemark(channel_index, channel, label,
+                                                  name_sites)]
         for i, (x, y, z, radius) in enumerate(zip(centers[:, 0], centers[:, 1],
                                                   centers[:, 2], radii),
                                               start=atom_index):
@@ -7674,7 +8350,7 @@ class ChannelCalculator:
 
     def saveChannelsToPdb(self, channels, filename, separate=False, num_samples=5,
                           tag='chl', label='channel', separate_path=None,
-                          separate_stem=None):
+                          separate_stem=None, name_sites=True):
         # ``channels`` is a flat list, already ordered by cost - that order is
         # the order they are written and numbered here. Each channel is preceded
         # by a REMARK reporting its length, bottleneck radius, curvature and cost.
@@ -7686,6 +8362,11 @@ class ChannelCalculator:
         # they come out as ``<stem>_lnk0.pqr`` and not ``<stem>_links_lnk0.pqr``.
         # ``separate_stem=''`` drops the stem from those names altogether, which
         # is what a run told only a directory does.
+        #
+        # ``name_sites=False`` drops the ``sp<n>`` tag from the names and the
+        # REMARKs. It tells the objects of one search site apart from another's,
+        # so it says nothing at all when the run had a single site: there every
+        # channel would carry the same sp0, which is clutter and not a label.
         filename = str(filename)
         separate_path = str(separate_path) if separate_path else filename
 
@@ -7695,7 +8376,7 @@ class ChannelCalculator:
             for channel_index, channel in enumerate(channels):
                 lines, samples = self._channelRecords(channel_index, channel,
                                                       atom_index, num_samples,
-                                                      label)
+                                                      label, name_sites)
                 pqr_file.writelines(lines)
                 pqr_file.write("\n")
                 atom_index += samples
@@ -7710,8 +8391,9 @@ class ChannelCalculator:
                 # <stem>_sp13_lnk0_sp9.pqr. Both ends are then greppable - the
                 # prefix still gathers everything traced out of sp13, and sp9
                 # now matches everything touching sp9 from either side.
-                origin = getattr(channel, 'origin', None)
-                destination = getattr(channel, 'destination', None)
+                origin = getattr(channel, 'origin', None) if name_sites else None
+                destination = (getattr(channel, 'destination', None)
+                               if name_sites else None)
                 object_tag = (tag if origin is None
                               else 'sp{0}_{1}'.format(origin, tag))
                 object_suffix = ('' if origin is None or destination is None
@@ -7722,20 +8404,22 @@ class ChannelCalculator:
 
                 with open(str(channel_filename), 'w') as pqr_file:
                     lines, _ = self._channelRecords(channel_index, channel,
-                                                    1, num_samples, label)
+                                                    1, num_samples, label,
+                                                    name_sites)
                     pqr_file.writelines(lines)
 
     @staticmethod
-    def _channelRemark(channel_index, channel, label='channel'):
+    def _channelRemark(channel_index, channel, label='channel', name_sites=True):
         """One-line PQR/PDB REMARK with a channel's basic geometry:
         length, bottleneck radius, curvature and Dijkstra cost."""
         curv = 'n/a' if np.isnan(channel.curvature) else "%.3f" % channel.curvature
         cost = 'n/a' if channel.cost is None else "%.4g" % channel.cost
         # "from sp13 to sp9" rather than a pair of assignments: both ends of a
         # link are start points, and reading them as a direction is the point.
-        # A channel has only the near end - the far end is the solvent.
-        origin = getattr(channel, 'origin', None)
-        destination = getattr(channel, 'destination', None)
+        # A channel has only the near end - the far end is the solvent. Left off
+        # entirely when the run had one site to name (see saveChannelsToPdb).
+        origin = getattr(channel, 'origin', None) if name_sites else None
+        destination = getattr(channel, 'destination', None) if name_sites else None
         where = '' if origin is None else "  from sp%d" % origin
         if where and destination is not None:
             where += " to sp%d" % destination
@@ -7875,7 +8559,7 @@ class ChannelCalculator:
         return total_volume
             
     def selectSeedTetrahedron(self, cavity, vertices, points, vdw_radii, simp,
-                              neighbors, sp, search_radius):
+                              neighbors, sp, search_radius, min_depth):
         '''Map `sp` to the seed tetrahedron of one cavity.
 
         The tetrahedron nearest `sp` (the anchor) is frequently a tight one, and every
@@ -7883,21 +8567,41 @@ class ChannelCalculator:
         their bottlenecks, and the shared first links show up as one common bottleneck
         at the joint beginning of the bundle. So the anchor only says where to look.
         The seed is the widest (largest inscribed radius) tetrahedron of this cavity
-        that lies within `search_radius` of `sp`, is no shallower than the anchor, and
-        is reachable from the anchor through the tetrahedra within `search_radius`.
-        Reachability is over the adjacency of the cleared tetrahedra, which is free
-        space, so the seed can only move through the void the start point sits in and
-        never hops across a wall into a lobe that merely passes nearby; the depth floor
-        keeps it from sliding outward towards the mouth, where tetrahedra are wide but
-        no longer inside the site. Note that the floor filters the seed, not the walk:
-        a marginally shallower cell in between must not wall off the wider region
-        behind it.
+        that lies within `search_radius` of `sp`, is buried deeply enough to still be
+        inside the site, and is reachable from the anchor through the tetrahedra within
+        `search_radius`. Reachability is over the adjacency of the cleared tetrahedra,
+        which is free space, so the seed can only move through the void the start point
+        sits in and never hops across a wall into a lobe that merely passes nearby; the
+        depth floor keeps it from sliding outward towards the mouth, where tetrahedra
+        are wide but no longer inside the site. Note that the floor filters the seed,
+        not the walk: a marginally shallower cell in between must not wall off the
+        wider region behind it.
+
+        The floor is `min_depth`, raised to the widest mouth of the cavity wherever an
+        opening is wider than that -- the same rule, and for the same reason, that
+        :meth:`setStartingTetrahedraFromChambers` applies to an automatically placed
+        seed. It is deliberately not the anchor's own depth. A start point is placed by
+        hand, usually on a bound ligand or a catalytic residue, and such a point
+        routinely sits deeper than the widest part of the pocket around it; held to the
+        anchor's depth the search then finds nothing eligible and leaves the seed on
+        the narrow cell nearest the point, capping every channel of the site at that
+        radius, which is the outcome the search exists to prevent -- and it fails
+        silently, since a pocket whose every route reports the same bottleneck looks
+        like a narrow pocket. Anything above the floor is inside the site by the
+        measure the module uses everywhere else, so a seed somewhat shallower than the
+        point is a seed in the same pocket. How much of the width the search can
+        actually reach from there is then a question of `search_radius` alone.
+
+        Where nothing in reach clears the raised floor the plain `min_depth` is tried,
+        for a site lying wholly under a wide opening, and failing that the anchor's own
+        depth, which always leaves at least the anchor itself.
 
         `search_radius` <= 0 restores the plain nearest-vertex seed.
 
         :returns: dict of the seed and anchor properties (`seed`, `anchor`, and their
             `_vertex`, `_distance` from `sp`, inscribed `_radius` and `_depth`), plus
-            the number of tetrahedra `searched` and how many of them were `eligible`'''
+            the number of tetrahedra `searched`, how many of them were `eligible`, and
+            the depth `floor` they had to clear'''
 
         from collections import deque
 
@@ -7914,16 +8618,23 @@ class ChannelCalculator:
                     vertices[tetra], points, vdw_radii, simp[tetra])),
                 depth=float(depths.get(tetra, 0.0)))
 
-        def report(seed, searched, eligible):
-            info = {'seed': seed, 'anchor': anchor,
-                    'searched': searched, 'eligible': eligible}
+        def report(seed, searched, eligible, floor):
+            info = {'seed': seed, 'anchor': anchor, 'searched': searched,
+                    'eligible': eligible, 'floor': float(floor)}
             for name, tetra in (('seed', seed), ('anchor', anchor)):
                 for key, value in properties(tetra).items():
                     info['{0}_{1}'.format(name, key)] = value
             return info
 
+        anchor_depth = float(depths.get(anchor, 0.0))
+
         if not search_radius or search_radius <= 0:
-            return report(anchor, 1, 1)
+            return report(anchor, 1, 1, anchor_depth)
+
+        def clearances(tetrahedra):
+            atoms = simp[tetrahedra]
+            return np.min(np.linalg.norm(points[atoms] - vertices[tetrahedra][:, None, :],
+                                         axis=2) - vdw_radii[atoms], axis=1)
 
         near = set(int(t) for t, close in zip(tet, d2 <= search_radius ** 2) if close)
 
@@ -7940,26 +8651,52 @@ class ChannelCalculator:
                     reachable.append(neighbor)
                     queue.append(neighbor)
 
-        anchor_depth = depths.get(anchor, 0)
-        eligible = [t for t in reachable if depths.get(t, 0) >= anchor_depth]
+        # How far down a seed has to be to be past the openings. The widest mouth
+        # of the cavity stands for all of them, since a route out of the seed is
+        # cut against whichever opening it reaches. _vertex_clearance is not built
+        # yet at seeding time, so the radii are measured here.
+        mouth = 0.0
+        exits = getattr(cavity, 'exit_tetrahedra', None)
+        if exits is not None and len(exits):
+            mouth = float(np.max(clearances(np.asarray(exits, dtype=np.intp))))
 
-        reach = np.array(eligible, dtype=np.intp)
-        atoms = simp[reach]
-        clearance = (np.linalg.norm(points[atoms] - vertices[reach][:, None, :], axis=2)
-                     - vdw_radii[atoms])
-        radii = clearance.min(axis=1)
-        # The anchor is eligible and comes first (BFS order), so argmax ties to it.
-        best = int(np.argmax(radii))
+        reach = np.array(reachable, dtype=np.intp)
+        radii = clearances(reach)
+        reach_depths = np.array([depths.get(int(t), 0.0) for t in reach])
 
-        return report(int(reach[best]), len(reachable), len(eligible))
+        # The anchor's depth closes the list because it always keeps the anchor,
+        # so some candidate always survives.
+        for floor in (max(float(min_depth), mouth), float(min_depth), anchor_depth):
+            eligible = np.flatnonzero(reach_depths >= floor)
+            if len(eligible):
+                break
+
+        # The anchor comes first (BFS order), so a tie goes to it where it qualifies.
+        best = int(reach[eligible[int(np.argmax(radii[eligible]))]])
+
+        return report(best, len(reachable), len(eligible), floor)
 
     def setStartingTetrahedraFromPoint(self, cavities, vertices, start_point,
                                        points, vdw_radii, simp, neighbors,
-                                       restrict=False, search_radius=5.0):
-        '''Set starting tetrahedra using a user-defined 3D point.
-        The starting tetrahedron of a cavity is the widest one `selectSeedTetrahedron`
-        finds in the neighbourhood of `start_point`; with ``search_radius=0`` it is
-        simply the one whose Voronoi vertex is closest to `start_point`.
+                                       search_radius=5.0, min_depth=5.0):
+        '''Restrict the search to the cavity `start_point` names, and seed it there.
+
+        The starting tetrahedron is the widest one `selectSeedTetrahedron` finds in
+        the neighbourhood of `start_point`; with ``search_radius=0`` it is simply the
+        one whose Voronoi vertex is closest to `start_point`. The cavity holding it is
+        the only one returned: a start point says which site to search, and channels
+        are computed for that site instead of one bundle per cavity in the structure.
+
+        `search_radius` is a requirement and not a hint. A cavity is a candidate only
+        if it holds a tetrahedron within that distance of `start_point`, and where no
+        cavity does, none is seeded and no channels are computed. The alternative is
+        to seed the nearest tetrahedron however far away it is, which is precisely the
+        seed the caller did not ask for: a start point that misses the void -- the
+        centroid of a residue selection routinely lands inside an atom -- is then
+        answered with channels through whatever cavity happens to lie nearest, and
+        nothing in the result says so. Refusing instead, and reporting where the
+        nearest tetrahedron actually is, lets the point be corrected. ``search_radius``
+        of 0 asks for no neighbourhood at all and so imposes no such distance either.
 
         :arg cavities: list of cavity objects
         :arg vertices: Voronoi vertices (array of shape (n, 3))
@@ -7969,60 +8706,68 @@ class ChannelCalculator:
         :arg vdw_radii: per-atom van der Waals radii (array of shape (n_atoms,))
         :arg simp: simplices (tetrahedron -> its 4 atom indices)
         :arg neighbors: tetrahedron adjacency (tetrahedron -> its 4 neighbours, -1 none)
-        :arg restrict: if True, only the single cavity whose closest tetrahedron is
-            globally nearest to `start_point` is seeded and returned, so channels are
-            computed exclusively for the region around `start_point`. If False (default),
-            every cavity is seeded with its own seed tetrahedron and all cavities are
-            returned unchanged.
-        :type restrict: bool
         :arg search_radius: radius, in Angstrom, of the neighbourhood of `start_point`
-            searched for a wider seed. 0 disables the search.
+            a seed must lie in. 0 disables both the search for a wider seed and the
+            distance requirement.
         :type search_radius: float
-        :returns: list of cavities to search: all cavities when `restrict` is False, the
-            single selected cavity when `restrict` is True, or an empty list if no cavity
-            has any tetrahedra'''
+        :arg min_depth: depth floor, in Angstrom, a seed must clear, so that the search
+            for a wider one cannot drift out of the site; raised per cavity to its
+            widest mouth. The same value that filters the cavities themselves.
+        :type min_depth: float
+        :returns: a single-element list holding the selected cavity, or an empty list
+            if no cavity has a tetrahedron within `search_radius` of `start_point`'''
 
         sp = np.asarray(start_point, dtype=float).reshape(3,)
 
-        best_cavity = None
-        best_info = None
-
-        for i, cavity in enumerate(cavities):
+        # Anchor every cavity by distance alone. The cavity the point names is the
+        # one holding the nearest tetrahedron, and that is settled here rather than
+        # by the seed search: widening moves the seed inside a cavity, it must never
+        # decide between cavities. `min` returns the first of any tie, so cavities
+        # equidistant from the point resolve in their original order.
+        anchored = []
+        for cavity in cavities:
             tet = cavity.tetrahedra
             if tet is None or len(tet) == 0:
                 continue
+            tet = np.asarray(tet)
+            distances = np.linalg.norm(vertices[tet] - sp, axis=1)
+            nearest = int(np.argmin(distances))
+            anchored.append((float(distances[nearest]), cavity, int(tet[nearest])))
 
-            info = self.selectSeedTetrahedron(
-                cavity, vertices, points, vdw_radii, simp, neighbors, sp, search_radius)
-
-            if not restrict:
-                cavity.setStartingTetrahedron(np.array([info['seed']]))
-                self.reportSeedTetrahedron(info, search_radius, cavity_index=i)
-
-            # The cavity is still chosen by proximity to start_point: widening moves the
-            # seed inside a cavity, it must never decide between cavities.
-            if best_info is None or info['anchor_distance'] < best_info['anchor_distance']:
-                best_info = info
-                best_cavity = cavity
-
-        if not restrict:
-            return cavities
-
-        if best_cavity is None:
+        if not anchored:
             _warn("start_point was provided but no cavity contains any "
                 "tetrahedron; no channels will be computed.")
             return []
 
-        best_cavity.setStartingTetrahedron(np.array([best_info['seed']]))
-        self.reportSeedTetrahedron(best_info, search_radius)
-        LOGGER.info("    restricting the channel search to the cavity that contains it "
-            "({0} tetrahedra, depth {1:.1f} Å).".format(len(best_cavity.tetrahedra),
-                                                        float(best_cavity.depth)))
+        distance, cavity, tetra = min(anchored, key=lambda entry: entry[0])
 
-        return [best_cavity]
+        if search_radius and search_radius > 0 and distance > search_radius:
+            vertex = vertices[tetra]
+            radius = float(self.calculateMaxRadius(vertex, points, vdw_radii,
+                                                   simp[tetra]))
+            _warn("start_point [{0:.3f}, {1:.3f}, {2:.3f}] has no cavity tetrahedron "
+                "within start_point_search={3:.1f} Å; the nearest one is {4:.3f} Å away "
+                "at [{5:.3f}, {6:.3f}, {7:.3f}] (inscribed radius {8:.3f} Å). No "
+                "channels will be computed. Move start_point towards that vertex, or "
+                "raise start_point_search above {4:.3f} Å to accept it."
+                .format(sp[0], sp[1], sp[2], float(search_radius), distance,
+                        vertex[0], vertex[1], vertex[2], radius))
+            return []
+
+        info = self.selectSeedTetrahedron(
+            cavity, vertices, points, vdw_radii, simp, neighbors, sp,
+            search_radius, min_depth)
+
+        cavity.setStartingTetrahedron(np.array([info['seed']]))
+        self.reportSeedTetrahedron(info, search_radius)
+        LOGGER.info("    restricting the channel search to the cavity that contains it "
+            "({0} tetrahedra, depth {1:.1f} Å).".format(len(cavity.tetrahedra),
+                                                        float(cavity.depth)))
+
+        return [cavity]
 
     def setStartingTetrahedraFromChambers(self, cavities, labels, volumes,
-                                          min_depth, seed_volume=30.0,
+                                          min_depth, seed_volume=50.0,
                                           max_seeds=None):
         '''Seed every cavity at each of its chambers instead of at its single
         deepest tetrahedron.
@@ -8046,6 +8791,21 @@ class ChannelCalculator:
         that chamber really has. Filtering by depth first and taking the widest
         of what remains keeps the seed inside the site.
 
+        How deep is deep enough is not an absolute length, though, because how
+        far below a mouth a point has to be to be past it is set by how wide that
+        mouth is. `min_depth` is measured in Angstrom while "still in the
+        opening" is measured by the opening's own radius, and under a wide one
+        the two part company: in a porin at ``surf_radius=10`` the widest mouth
+        has a 7.5 A radius, so a tetrahedron 5.3 A down clears `min_depth=5` and
+        is still inside the mouth. Seeding there costs the whole site - every
+        route out of it leaves by that one opening, the dedup cuts them all
+        against it, and the chamber reports a single stub instead of the pore.
+        So the depth floor is raised to the widest opening the cavity has, and
+        the seed has to clear that. Ordinary mouths measure 1-3 A and sit below
+        `min_depth`, which leaves the floor where it was: this only acts once an
+        opening is wider than the depth demanded of a seed, which is where the
+        absolute floor stops meaning what it says.
+
         Cavities are left with the seed `findDeepestTetrahedra` gave them when no
         chamber of theirs qualifies, so a pocket too narrow to hold the chamber
         probe still reports its channels.
@@ -8066,7 +8826,12 @@ class ChannelCalculator:
             cavity scale (Delaunay tetrahedra summed). It is a floor on where a
             search may start, independent of the ``min_volume`` the caller
             applies to the objects it reports, which is measured on the
-            swept-sphere scale instead. ``None`` applies no floor. Default 30.
+            swept-sphere scale instead. ``None`` applies no floor. Default 50.
+
+            The caller applies the same floor to the cavities before handing them
+            over, so every cavity here has already cleared it: the whole-cavity
+            fallback below decides only *where* in a cavity to start, never
+            whether it is a site at all.
         :type seed_volume: float or None
 
         :arg max_seeds: cap on the seeds of one cavity, widest chamber first.
@@ -8102,11 +8867,31 @@ class ChannelCalculator:
                 if label >= 0 and volumes[label] >= floor:
                     chambers.setdefault(int(label), []).append(int(tetra))
 
+            # The depth a seed has to clear to be past the mouths, which is
+            # min_depth until an opening is wider than that (see the note above).
+            # The widest opening of the cavity stands for all of them: a seed is
+            # cut against whichever opening its routes reach, not only the
+            # nearest, so clearing the widest is what puts it past every one.
+            # This is the same radius the dedup measures an opening by, so "below
+            # the mouth" means one thing on both sides.
+            mouth = 0.0
+            exit_tetrahedra = getattr(cavity, 'exit_tetrahedra', None)
+            if exit_tetrahedra is not None and len(exit_tetrahedra):
+                mouth = float(np.max(
+                    clearance[np.asarray(exit_tetrahedra, dtype=np.intp)]))
+            seed_depth = max(float(min_depth), mouth)
+
             def widestDeepest(members):
-                """The widest of `members` that is at least `min_depth` deep."""
+                """The widest of `members` that lies below the mouths: no
+                shallower than `seed_depth`, falling back to `min_depth` where a
+                chamber holds nothing that deep, so that a site whose whole
+                extent lies under a wide opening still reports its channels."""
                 members = np.asarray(members, dtype=np.intp)
-                deep = members[np.array([depths.get(int(t), 0.0)
-                                         for t in members]) >= min_depth]
+                member_depths = np.array([depths.get(int(t), 0.0)
+                                          for t in members])
+                deep = members[member_depths >= seed_depth]
+                if len(deep) == 0:
+                    deep = members[member_depths >= min_depth]
                 if len(deep) == 0:
                     return None
                 return int(deep[np.argmax(clearance[deep])])
@@ -8133,7 +8918,9 @@ class ChannelCalculator:
                 # would keep the deepest tetrahedron findDeepestTetrahedra picked,
                 # which is chosen without reference to width - and since every
                 # channel of the cavity leaves through its seed, a narrow one caps
-                # all of their bottlenecks. 
+                # all of their bottlenecks. The cavity has already cleared
+                # seed_volume in the caller, so this is a choice of seed and not a
+                # way back in for a void the floor excluded.
                 seed = widestDeepest(tetrahedra)
                 if seed is not None:
                     cavity.setStartingTetrahedron(np.array([seed]))
@@ -8173,31 +8960,31 @@ class ChannelCalculator:
 
         return reseeded, notes
 
-    def reportSeedTetrahedron(self, info, search_radius, cavity_index=None):
+    def reportSeedTetrahedron(self, info, search_radius):
         '''Log the seed tetrahedron `selectSeedTetrahedron` picked, and, when it is not
         the one nearest the start point, the anchor it replaced -- the two radii are what
         tell the user whether the seed was capping the bottlenecks of the cavity.'''
 
-        where = '' if cavity_index is None else ' of cavity {0}'.format(cavity_index)
-        LOGGER.info("start_point seeded at tetrahedron {0}{1} (Voronoi vertex at "
-            "[{2:.3f}, {3:.3f}, {4:.3f}], {5:.3f} Å from start_point, inscribed radius "
-            "{6:.3f} Å, depth {7:.1f} Å)."
-            .format(info['seed'], where, info['seed_vertex'][0], info['seed_vertex'][1],
+        LOGGER.info("start_point seeded at tetrahedron {0} (Voronoi vertex at "
+            "[{1:.3f}, {2:.3f}, {3:.3f}], {4:.3f} Å from start_point, inscribed radius "
+            "{5:.3f} Å, depth {6:.1f} Å)."
+            .format(info['seed'], info['seed_vertex'][0], info['seed_vertex'][1],
                     info['seed_vertex'][2], info['seed_distance'], info['seed_radius'],
                     info['seed_depth']))
 
         if info['seed'] != info['anchor']:
             LOGGER.info("    widened from the nearest tetrahedron {0} ({1:.3f} Å away, "
                 "inscribed radius {2:.3f} Å, depth {3:.1f} Å), the widest of the {4} tetrahedra "
-                "no shallower than it among the {5} reachable within {6:.1f} Å; seeding "
+                "at least {5:.1f} Å deep among the {6} reachable within {7:.1f} Å; seeding "
                 "the narrow one would have capped every channel here at its radius."
                 .format(info['anchor'], info['anchor_distance'], info['anchor_radius'],
-                        info['anchor_depth'], info['eligible'], info['searched'],
-                        float(search_radius)))
+                        info['anchor_depth'], info['eligible'], info['floor'],
+                        info['searched'], float(search_radius)))
         elif search_radius and search_radius > 0:
-            LOGGER.info("    already the widest of the {0} tetrahedra no shallower than "
-                "it among the {1} reachable within {2:.1f} Å."
-                .format(info['eligible'], info['searched'], float(search_radius)))
+            LOGGER.info("    already the widest of the {0} tetrahedra at least {1:.1f} Å "
+                "deep among the {2} reachable within {3:.1f} Å."
+                .format(info['eligible'], info['floor'], info['searched'],
+                        float(search_radius)))
 
 
     def trimCavitiesByDepth(self, cavities, max_depth):
@@ -8207,3 +8994,222 @@ class ChannelCalculator:
             cavity.tetrahedra = np.array([
                 tetra for tetra in cavity.tetrahedra
                 if cavity.tetrahedra_depths.get(tetra, np.inf) <= max_depth])
+
+
+#: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside the
+#: PQR output. Held inline so that this module carries everything it writes,
+#: and raw so the rank patterns keep their backslashes.
+_VIS_CHANNELS_SCRIPT = r'''import colorsys
+import glob
+import os
+import re
+import sys
+
+# --- Parse command-line args ---
+# Invoke as:  pymol vis_channels.py -- protein.pdb "por*chl*.pqr"
+# The regex MUST be quoted so the shell doesn't glob-expand it before PyMOL sees it.
+protein_file = None
+channel_regex = None
+for arg in sys.argv[1:]:
+    if arg == "--":
+        continue
+    if os.path.isfile(arg):
+        if protein_file is None:
+            protein_file = arg
+    elif channel_regex is None:
+        channel_regex = arg
+
+if channel_regex is None:
+    channel_regex = "*chl*.pqr"   # fallback default
+print(f"Using channel regex: {channel_regex}")
+
+# --- Palette ---
+# CAVER 3's first six colours, from its out/pymol/modules/rgb.py in the order
+# its view.py hands them to tunnel clusters. They are what makes a CAVER figure
+# recognisable, so they are kept verbatim. Its remaining 1000 are a long table
+# of pastels that the generator below beats on separation, so they are not.
+CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
+                   (0.0, 1.0, 0.0),    # green
+                   (1.0, 0.0, 0.0),    # red
+                   (0.0, 1.0, 1.0),    # cyan
+                   (1.0, 1.0, 0.0),    # yellow
+                   (1.0, 0.0, 1.0)]    # magenta
+
+# Past the six, colours are generated rather than tabulated. The hue steps by
+# the golden angle -- an irrational fraction of the circle, so it never returns
+# to a hue it has used and consecutive steps land as far apart as the circle
+# allows -- while saturation and value cycle on 3, so neighbours differ in more
+# than hue alone. The offset keeps the early generated hues clear of the six
+# primaries: without it rank 12 lands beside blue. It was chosen by maximising
+# the smallest CIE-Lab separation over 8..24 colours, where most cases sit,
+# which holds that separation near 15 where CAVER's own table dropped to 5.
+GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
+HUE_OFFSET = 0.098
+SATURATION_VALUE = ((0.95, 1.00), (0.70, 1.00), (0.95, 0.72))
+
+def caverColour(rank):
+    """Name of the colour for a 0-based channel rank, registered on first use.
+
+    A pure function of the rank, with no table to run off the end of: a rank is
+    the same colour in every structure and every run, whatever was loaded
+    beside it and however many channels the case turned out to have.
+    """
+    if rank < len(CAVER_PRIMARIES):
+        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
+    else:
+        step = rank - len(CAVER_PRIMARIES)
+        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
+        name = "gen%d" % rank
+        rgb = colorsys.hsv_to_rgb(
+            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
+    cmd.set_color(name, list(rgb))
+    return name
+
+if protein_file:
+    protein_name = os.path.splitext(os.path.basename(protein_file))[0]
+    cmd.load(protein_file, protein_name)
+    cmd.hide("everything", protein_name)
+    cmd.show("cartoon", protein_name)
+    cmd.show("surface", protein_name)
+    cmd.color("grey80", protein_name)
+    cmd.set("transparency", 0.5, protein_name)
+    print(f"Loaded protein: {protein_name}")
+else:
+    print("No protein file found in args (use: pymol vis_channels.py -- your.pdb)")
+
+# --- Load channels/tunnels ---
+def natural_sort_key(s):
+    parts = re.split(r'(\d+\.\d+|\d+)', s)
+    key = []
+    for text in parts:
+        try:
+            key.append(float(text))
+        except ValueError:
+            key.append(text.lower())
+    return key
+
+def loadSpheres(filename, colour):
+    """Show a PQR as its real probe spheres, in one colour.
+
+    The radius is read from the file text and assigned with `alter`. Do NOT use
+    `vdw=b`: PyMOL parses a .pqr extension with its PQR reader, which does not
+    put this column in the B-factor, so `vdw=b` sets every radius to zero and
+    the spheres vanish while the object is still loaded.
+    """
+    obj_name = os.path.splitext(os.path.basename(filename))[0]
+    cmd.load(filename, obj_name)
+    radii_list = []
+    with open(filename, 'r') as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                radii_list.append(float(line.split()[-1]))
+    if radii_list:
+        cmd.alter(obj_name, "vdw = radii_list.pop(0)",
+                  space={'radii_list': radii_list})
+    cmd.hide("everything", obj_name)
+    cmd.show("spheres", obj_name)
+    cmd.color(colour, obj_name)
+    return obj_name
+
+# Which number in the name is the rank, tried in the order the two producers
+# write them. chl0.pqr counts from 0; CAVER writes tun_cl_001_1.pdb and colours
+# by the cluster 001, not by the trailing tunnel index within it, and numbers
+# its clusters from 1 -- so that one is shifted down to share the 0-based scale.
+RANK_PATTERNS = ((r'chl(\d+)', 0),
+                 (r'cl_(\d+)', 1),
+                 (r'(\d+)', 0))      # anything else: the first number in the name
+
+UNRANKED = "grey60"   # for a file whose name carries no number
+
+def channelRank(filename):
+    """Rank deciding the colour: the number the producer put in the file name.
+
+    Read from the name rather than from the position in the loaded list, so a
+    channel keeps its colour whether or not its lower-numbered siblings were
+    written and whatever else the glob picked up alongside it. None when the
+    name holds no number at all.
+    """
+    base = os.path.basename(filename)
+    for pattern, first in RANK_PATTERNS:
+        match = re.search(pattern, base)
+        if match:
+            return max(0, int(match.group(1)) - first)
+    return None
+
+def freeName(name):
+    """`name`, or the first numbered variant of it no loaded object has taken.
+
+    The all-channels dump written beside the per-channel files loads as an
+    object named after the set, and PyMOL refuses to make a group over a name
+    an ordinary object already holds.
+    """
+    taken = set(cmd.get_names("objects"))
+    suffix = ""
+    while name + suffix in taken:
+        suffix = str(int(suffix or 1) + 1)
+    return name + suffix
+
+# both sets read their rank off the same 0-based scale, so the first channel of
+# either program is blue and the two stay comparable side by side
+sets = [("chnl_grp", sorted(glob.glob(channel_regex), key=natural_sort_key), False),
+        ("tun_grp", sorted(glob.glob("tun_*"), key=natural_sort_key), True)]
+
+if not any(files for _, files, _ in sets):
+    print("Error: No channel files found. Check your working directory (pwd).")
+else:
+    for group, files, start_off in sets:
+        objects, unranked = [], []
+        ranks = [channelRank(f) for f in files]
+        # channels.pqr, the dump of every channel at once, sits beside the
+        # per-channel files and carries no number, so there is no rank to
+        # colour it by -- and being a copy of all of them it would hide them.
+        # Grey it and start it switched off. Unless nothing in the set has a
+        # rank, in which case the set is dumps only and position will do.
+        grey_the_unranked = any(rank is not None for rank in ranks)
+        for i, (filename, rank) in enumerate(zip(files, ranks)):
+            grey = rank is None and grey_the_unranked
+            colour = UNRANKED if grey else caverColour(i if rank is None else rank)
+            obj = loadSpheres(filename, colour)
+            objects.append(obj)
+            print(f"  {obj:<20s} {colour}{'  (no rank in name, off)' if grey else ''}")
+            if grey:
+                unranked.append(obj)
+        if objects:
+            name = freeName(group)
+            cmd.group(name, " ".join(objects))
+            if start_off:
+                cmd.disable(name)
+        for obj in unranked:          # after the group, which enables its members
+            cmd.disable(obj)
+    cmd.rebuild()
+    cmd.set("sphere_scale", 1.0)
+    cmd.set("sphere_quality", 2)
+    cmd.bg_color("white")
+    cmd.zoom()
+    print("Success: Files loaded in perfect sequential order with custom radii!")
+'''
+
+
+def _writeVisScript(directory, pattern='chl*.pqr'):
+    """Leave ``vis_channels.py`` in ``directory`` unless it is already there.
+
+    A run drops a viewer beside its PQRs, as CAVER leaves ``view.py`` beside its
+    clusters, so the output can be opened without hunting for a script. An
+    existing file is never overwritten: edits made to one run's copy survive a
+    rerun, and so does a newer script left by an earlier one.
+    """
+    import os
+
+    path = os.path.join(str(directory), 'vis_channels.py')
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, 'w') as script_file:
+            script_file.write(_VIS_CHANNELS_SCRIPT)
+    except (IOError, OSError) as err:
+        # a viewer that cannot be written is no reason to lose the run
+        _warn("Could not write the PyMOL viewer {0}: {1}".format(path, err))
+    else:
+        LOGGER.info('Wrote the PyMOL viewer {0}. View the output with '
+                    '`pymol vis_channels.py -- <protein>.pdb "{1}"`.'.format(
+                        path, pattern))
