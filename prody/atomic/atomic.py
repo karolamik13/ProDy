@@ -8,7 +8,7 @@ from prody import LOGGER, __path__
 from prody.utilities import openData
 
 from . import flags
-from .bond import trimBonds
+from .bond import trimBonds, trimTerms
 from .fields import READONLY
 
 __all__ = ['Atomic', 'AAMAP']
@@ -24,12 +24,22 @@ with openData('mod_res_map.dat') as f:
         except:
             continue
 
+CORE_AAMAP = AAMAP = {
+    'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C', 'GLN': 'Q',
+    'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K',
+    'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S', 'THR': 'T', 'TRP': 'W',
+    'TYR': 'Y', 'VAL': 'V'
+}
+
+invAAMAP = dict((v, k) for k, v in CORE_AAMAP.items())
+
 AAMAP = {
     'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C', 'GLN': 'Q',
     'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K',
     'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S', 'THR': 'T', 'TRP': 'W',
     'TYR': 'Y', 'VAL': 'V',
-    'ASX': 'B', 'GLX': 'Z', 'SEC': 'U', 'PYL': 'O', 'XLE': 'J', '': '-'
+    'ASX': 'B', 'GLX': 'Z', 'SEC': 'U', 'PYL': 'O', 'XLE': 'J', '': '-',
+    'UNK': 'X'
 }
 
 # add bases
@@ -42,7 +52,7 @@ for aaa, a in AAMAP.items():
     _[a] = aaa
 AAMAP.update(_)
 
-# add modified AAs
+# add modified AAs and bases to AAMAP
 MODAAMAP = {}
 for mod, aa in MODMAP.items():
     if aa in AAMAP:
@@ -203,25 +213,38 @@ class Atomic(object):
             new._setFlags('dummy', dummy)
             new._setFlags('mapped', mapped)
 
-        bonds = ag._bonds
-        bmap = ag._bmap
-        if bonds is not None and bmap is not None:
-            if indices is None:
-                new._bonds = bonds.copy()
-                new._bmap = bmap.copy()
-                new._data['numbonds'] = ag._data['numbonds'].copy()
-            elif dummies:
-                if dummies:
-                    indices = indices[self._getMapping()]
-                if len(set(indices)) == len(indices):
-                    new.setBonds(trimBonds(bonds, indices))
-                else:
-                    LOGGER.warn('Duplicate atoms in mapping, bonds are '
-                                'not copied.')
+        # every topology section, not bonds alone: a copy that kept only the bonds
+        # silently dropped the angles, dihedrals, impropers, donors, acceptors,
+        # exclusions and CMAP cross-terms of a CHARMM system
+        TOPOLOGY = [('_bonds', '_bmap', 'numbonds', new.setBonds),
+                    ('_angles', '_angmap', 'numangles', new.setAngles),
+                    ('_dihedrals', '_dmap', 'numdihedrals', new.setDihedrals),
+                    ('_impropers', '_imap', 'numimpropers', new.setImpropers),
+                    ('_donors', '_domap', 'numdonors', new.setDonors),
+                    ('_acceptors', '_acmap', 'numacceptors', new.setAcceptors),
+                    ('_nbexclusions', '_nbemap', 'numnbexclusions',
+                     new.setNBExclusions),
+                    ('_crossterms', '_cmap', 'numcrossterms', new.setCrossterms)]
+
+        if dummies and indices is not None:
+            if len(set(indices)) == len(indices):
+                indices = indices[self._getMapping()]
             else:
-                bonds = trimBonds(bonds, indices)
-                if bonds is not None:
-                    new.setBonds(bonds)
+                LOGGER.warn('Duplicate atoms in mapping, topology is not copied.')
+                return new
+
+        for attr, mapattr, numlabel, setter in TOPOLOGY:
+            terms = getattr(ag, attr)
+            if terms is None or getattr(ag, mapattr) is None:
+                continue
+            if indices is None:
+                setattr(new, attr, terms.copy())
+                setattr(new, mapattr, getattr(ag, mapattr).copy())
+                new._data[numlabel] = ag._data[numlabel].copy()
+            else:
+                terms = trimTerms(terms, indices)
+                if terms is not None:
+                    setter(terms)
         return new
 
     __copy__ = copy
@@ -242,19 +265,48 @@ class Atomic(object):
         return ag._title
     
     def getSequence(self, **kwargs):
-        """Returns one-letter sequence string for amino acids.
+        """Returns one-letter sequence string for amino acids, unless *longSeq*
+        or *threeLetter* is **True**.
         When *allres* keyword argument is **True**, sequence will include all
         residues (e.g. water molecules) in the chain and **X** will be used for
         non-standard residue names."""
 
+        longSeq = kwargs.get('longSeq', kwargs.get('threeLetter', False))
+
         get = AAMAP.get
         if hasattr(self, 'getResnames'):
-            seq = ''.join([get(res, 'X') for res in self.getResnames()])
+            if longSeq:
+                seq = ' '.join(self.getResnames())
+            else:
+                seq = ''.join([get(res, 'X') for res in self.getResnames()])
         else:
             res = self.getResname()
-            seq = get(res, 'X')
+            if longSeq:
+                seq = res
+            else:
+                seq = get(res, 'X')
         
         return seq
+
+    def getHierView(self, **kwargs):
+        """Returns a hierarchical view of the atom selection."""
+
+        return HierView(self, **kwargs)
+
+    def numSegments(self):
+        """Returns number of segments."""
+
+        return self.getHierView().numSegments()
+
+    def numChains(self):
+        """Returns number of chains."""
+
+        return self.getHierView().numChains()
+
+    def numResidues(self):
+        """Returns number of residues."""
+
+        return self.getHierView().numResidues()
 
     def toTEMPyAtoms(self):
         """Returns a :class:`TEMPy.protein.prot_rep_biopy.Atom` or list of them as appropriate"""
@@ -277,12 +329,6 @@ class Atomic(object):
 
         return BioPy_Structure(self.toTEMPyAtoms())
 
-    def numResidues(self):
-        """Returns number of residues."""
-
-        return len(set(self._getResindices()))
-
-
     def toBioPythonStructure(self, header=None, **kwargs):
         """Returns a :class:`Bio.PDB.Structure` object
 
@@ -292,9 +338,7 @@ class Atomic(object):
         :arg csets: coordinate set indices, default is all coordinate sets
         """ 
         try:
-            from Bio.PDB.Structure import Structure
             from Bio.PDB.StructureBuilder import StructureBuilder
-            from Bio.PDB.PDBParser import PDBParser
             from Bio.PDB.PDBExceptions import PDBConstructionException
         except ImportError:
             raise ImportError('Bio StructureBuilder could not be imported. '
@@ -318,7 +362,7 @@ class Atomic(object):
         
         for i in csets:
             self.setACSIndex(i)
-            structure_builder.init_model(i)
+            structure_builder.init_model(i, i+1)
 
             current_segid = None
             current_chain_id = None

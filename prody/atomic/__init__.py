@@ -163,6 +163,7 @@ from .selection import *
 
 from . import flags
 from . import atomic
+atomic.NAMAP = flags.NAMAP
 from . import select
 from . import atommap
 from . import pointer
@@ -186,6 +187,7 @@ atomic.isSelectionMacro = isSelectionMacro
 atomic.AtomMap = AtomMap
 atomic.AtomGroup = AtomGroup
 atomic.Selection = Selection
+atomic.HierView = HierView
 
 atomgroup.isReserved = isReserved
 atomgroup.HierView = HierView
