@@ -15,23 +15,32 @@ class Bond(object):
     * :func:`len` returns bond length, i.e. :meth:`getLength`
     * :func:`iter` yields :class:`~.Atom` instances"""
 
-    __slots__ = ['_ag', '_acsi', '_indices']
+    __slots__ = ['_ag', '_acsi', '_indices', '_bondOrder']
+    _bondType = {1:'single', 2:'double', 3:'triple', 4:'aromatic', 5:'amide', }
 
     def __init__(self, ag, indices, acsi=None):
 
         self._ag = ag
-        self._indices = np.array(indices)
+        i, j  = self._indices = np.array(indices)
+        if self._ag._bondOrders is not None:
+            if i>j:
+                a=i
+                i=j
+                j=a
+            self._bondOrder = self._ag._bondOrders[self._ag._bondIndex['%d %d'%(i,j)]]
+        else:
+            self._bondOrder = 1 # single bond by default
         if acsi is None:
             self._acsi = ag.getACSIndex()
         else:
             self._acsi = acsi
 
     def __repr__(self):
-
         one, two = self._indices
         names = self._ag._getNames()
-        return '<Bond: {0}({1})--{2}({3}) from {4}>'.format(
-                            names[one], one, names[two], two, str(self._ag))
+        return '<Bond: {0}({1})--{2}({3}) from {4}, bond order: {5}>'.format(
+            names[one], one, names[two], two, str(self._ag),
+            self._bondType[self._bondOrder])
 
     def __str__(self):
 
@@ -119,7 +128,8 @@ def evalBonds(bonds, n_atoms):
     """Returns an array mapping atoms to their bonded neighbors and an array
     that stores number of bonds made by each atom."""
 
-    numbonds = np.bincount(bonds.reshape((bonds.shape[0] * 2)))
+    numbonds = np.bincount(bonds.reshape((bonds.shape[0] * 2)),
+                           minlength=n_atoms)
     bmap = np.zeros((n_atoms, numbonds.max()), int)
     bmap.fill(-1)
     index = np.zeros(n_atoms, int)
@@ -131,12 +141,24 @@ def evalBonds(bonds, n_atoms):
     return bmap, numbonds
 
 
-def trimBonds(bonds, indices):
-    """Returns bonds between atoms at given indices."""
+def trimTerms(terms, indices):
+    """Returns the *terms* whose atoms all lie at *indices*, renumbered so that the
+    atom at ``indices[i]`` becomes atom ``i``.  Works for any term width -- bonds,
+    angles, dihedrals, impropers, donors, acceptors, exclusions and eight-atom CMAP
+    cross-terms -- and keeps both the order of the terms and the order of the atoms
+    within each one, which for every term but a bond is what identifies it.  A term
+    only partly inside *indices* cannot be renumbered and is dropped."""
 
     iset = set(indices)
-    bonds = [bond for bond in bonds if bond[0] in iset and bond[1] in iset]
-    if bonds:
+    terms = [term for term in terms if iset.issuperset(term)]
+    if terms:
         newindices = np.zeros(indices.max()+1, int)
         newindices[indices] = np.arange(len(indices))
-        return newindices[np.array(bonds)]
+        return newindices[np.array(terms)]
+
+
+def trimBonds(bonds, indices):
+    """Returns bonds between atoms at given indices.  See :func:`.trimTerms`, of
+    which this is the two-atom case."""
+
+    return trimTerms(bonds, indices)

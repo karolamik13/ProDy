@@ -13,6 +13,7 @@ import numpy as np
 from prody import LOGGER, SETTINGS, PY3K
 from prody.utilities import showFigure, addEnds, showMatrix
 from prody.atomic import AtomGroup, Selection, Atomic, sliceAtoms, sliceAtomicData
+from prody.measure import calcRMSD
 
 from .nma import NMA
 from .gnm import GNMBase, GNM
@@ -25,6 +26,8 @@ from .perturb import calcPerturbResponse
 from .compare import calcOverlap
 from .lda import LDA
 from .logistic import LRA
+from .rmsd_clustering import _validateDistanceMatrix, calcPairwiseRMSD
+
 
 __all__ = ['showContactMap', 'showCrossCorr', 'showCovarianceMatrix',
            'showCumulOverlap', 'showFractVars',
@@ -37,7 +40,9 @@ __all__ = ['showContactMap', 'showCrossCorr', 'showCovarianceMatrix',
            'showPairDeformationDist','showMeanMechStiff', 
            'showPerturbResponse', 'showTree', 'showTree_networkx',
            'showAtomicMatrix', 'pimshow', 'showAtomicLines', 'pplot', 
-           'showDomainBar']
+           'showDomainBar', 'showAtomicBars', 'showSelectionMatrix',
+           'showRMSDEvolution', 'showPairwiseRMSDHeatmap', 'showClusterRMSDComparison',
+           'showClusterRMSDEvolution', 'showClusterBarcode']
 
 
 def showEllipsoid(modes, onto=None, n_std=2, scale=1., *args, **kwargs):
@@ -239,6 +244,9 @@ def showProjection(ensemble=None, modes=None, projection=None, *args, **kwargs):
 
     The projected values are by default converted to RMSD.  Pass ``rmsd=False``
     to use projection itself.
+    
+    By default, the projection is not normalized. If you would like it to be,
+    pass ``norm=True``.
 
     Matplotlib function used for plotting depends on the number of modes:
 
@@ -271,6 +279,8 @@ def showProjection(ensemble=None, modes=None, projection=None, *args, **kwargs):
         weights = kwargs.pop('weights', None)
         weights = None
 
+    markersize = kwargs.pop('markersize', None)
+
     num = projection.shape[0]
 
     use_labels = kwargs.pop('use_labels', True)
@@ -283,8 +293,14 @@ def showProjection(ensemble=None, modes=None, projection=None, *args, **kwargs):
             labels = modes.getModel()._labels.tolist()
             LOGGER.info('using labels from LDA model')
 
-    if labels is not None and len(labels) != num:
-        raise ValueError('label should have the same length as ensemble')
+    one_label = False
+    if labels is not None:
+        if len(labels) == 1 or np.isscalar(labels):
+            one_label = True
+            kwargs['label'] = labels
+
+        elif len(labels) != num:
+            raise ValueError('label should have the same length as ensemble')
 
     c = kwargs.pop('c', 'b')
     colors = kwargs.pop('color', c)
@@ -297,14 +313,14 @@ def showProjection(ensemble=None, modes=None, projection=None, *args, **kwargs):
         if len(colors) != num:
             raise ValueError('length of color must be {0}'.format(num))
     elif isinstance(colors, dict):
-        if labels is None:
+        if labels is None or one_label:
             raise TypeError('color must be a string or a list unless labels are provided')
         colors_dict = colors
         colors = [colors_dict[label] for label in labels]
     else:
         raise TypeError('color must be a string or a list or a dict if labels are provided')
 
-    if labels is not None and len(colors_dict) == 0:
+    if labels is not None and not one_label and len(colors_dict) == 0:
         cycle_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         for i, label in enumerate(set(labels)):
             colors_dict[label] = cycle_colors[i % len(cycle_colors)]
@@ -318,6 +334,8 @@ def showProjection(ensemble=None, modes=None, projection=None, *args, **kwargs):
             show = plt.plot(range(len(projection)), projection.flatten(), *args, **kwargs)
             if use_weights:
                 kwargs['s'] = weights
+            elif markersize is not None:
+                kwargs['s'] = markersize
             if labels is not None and use_labels:
                 for label in set(labels):
                     kwargs['c'] = colors_dict[label]
@@ -444,6 +462,8 @@ def showProjection(ensemble=None, modes=None, projection=None, *args, **kwargs):
             kwargs['c'] = color
             if weights is not None and use_weights:
                 kwargs['s'] = weights
+            elif markersize is not None:
+                kwargs['s'] = markersize
             plot(*(list(projection[indices].T) + args), **kwargs)
         else:
             kwargs['color'] = color
@@ -1132,6 +1152,9 @@ def showOverlap(mode, modes, *args, **kwargs):
 
     :arg modes: multiple modes
     :type modes: :class:`.ModeSet`, :class:`.ANM`, :class:`.GNM`, :class:`.PCA`
+
+    :arg abs: whether to take absolute values
+    :type abs: bool
     """
 
     import matplotlib.pyplot as plt
@@ -1149,9 +1172,16 @@ def showOverlap(mode, modes, *args, **kwargs):
                         .format(type(modes)))
 
     if mode.numModes() > 1:
-        overlap = abs(calcOverlap(mode, modes, diag=True))
+        overlap = calcOverlap(mode, modes, diag=True)
     else:
-        overlap = abs(calcOverlap(mode, modes, diag=False))
+        overlap = calcOverlap(mode, modes, diag=False)
+
+    take_abs = kwargs.pop('abs', True)
+    if not isinstance(take_abs, bool):
+        raise TypeError('abs should be a Boolean (True or False)')
+
+    if take_abs:
+        overlap = abs(overlap)
 
     if isinstance(modes, NMA):
         arange = np.arange(len(modes)) + 1
@@ -1638,7 +1668,8 @@ def showAtomicMatrix(matrix, x_array=None, y_array=None, atoms=None, **kwargs):
     interactive = kwargs.pop('interactive', True)
     
     import matplotlib
-    if float(matplotlib.__version__[:-2]) >= 3.6:
+    mpl_version = tuple(int(x) for x in matplotlib.__version__.split('.')[:2])
+    if mpl_version >= (3, 6):
         LOGGER.warn('matplotlib 3.6 and later are not compatible with interactive matrices')
         interactive = False
 
@@ -2063,6 +2094,268 @@ def showAtomicLines(*args, **kwargs):
         showFigure()
     return lines, polys, bars, texts
 
+def showAtomicBars(*args, **kwargs):
+    """
+    Show a bar chart with the option to use residue numbers and include chain/domain color 
+    bars using provided atoms.
+    
+    :arg atoms: a :class: `AtomGroup` instance for matching 
+        residue numbers and chain identifiers. 
+    :type atoms: :class: `AtomGroup`
+
+    :keyword chain: display a bar at the bottom to show chain separations. 
+        If set to **None**, it will be decided depends on whether *atoms* 
+        is provided. 
+        Default is **None**.
+    :type chain: bool
+
+    :keyword domain: the same with *chains* but show domain separations instead. 
+        *atoms* needs to have *domain* data associated to it.
+        Default is **None**.
+    :type domain: bool
+
+    :keyword gap: whether show the gaps in the *atoms* or not.
+        Default is **False**.
+    :type gap: bool
+
+    :keyword overlay: whether overlay the curves based on the chain separations 
+        in *atoms* or not.
+        Default is **False**.
+    :type overlay: bool
+
+    :keyword figure: if set to **None**, then a new figure will be created if *auto_show* 
+        is **True**, otherwise it will be plotted on the current figure. If set 
+        to a figure number or string or a :class:`~matplotlib.figure.Figure` instance, 
+        no matter what 'auto_show' value is, plots will be drawn on the *figure*.
+        Default is **None**.
+    :type figure: :class:`~matplotlib.figure.Figure`, int, str
+
+    :keyword final: if set to **False**, *chain* and *domain* will be set to **False** 
+                    no matter what their values are. This is used to stack plots onto one 
+                    another, and show only one domain/chain bar.
+    :type final: bool
+    """
+    
+    x = None
+    xy_args = []
+    #linespec = '-'
+    for arg in args:
+        if isinstance(arg, str):
+            LOGGER.warn('currently string arguments are not supported')
+            #linespec = arg
+        else:
+            xy_args.append(arg)
+
+    if len(xy_args) == 0:
+        raise ValueError('no data is given for plotting')
+    elif len(xy_args) == 1:
+        y = xy_args[0]
+    elif len(xy_args) >= 2: 
+        if len(xy_args) > 2:
+            LOGGER.warn("args contains more than x's and y's; only the first two arrays are used")
+        x = xy_args[0]
+        y = xy_args[1]
+
+    atoms = kwargs.pop('atoms', None)
+    #linespec = kwargs.pop('linespec', linespec)
+    show_chain = kwargs.pop('chains', None)
+    show_domain = kwargs.pop('domains', None)
+    show_chain = kwargs.pop('chain', show_chain)
+    show_domain = kwargs.pop('domain', show_domain)
+    final = kwargs.pop('final', True)
+    if not final:
+        show_domain = show_chain = False
+
+    chain_text_loc = kwargs.pop('chain_text_loc', 'above')
+    domain_text_loc = kwargs.pop('domain_text_loc', 'below')
+    zero_line = kwargs.pop('show_zero', False)
+    zero_line = kwargs.pop('zero', zero_line)
+    show_text = kwargs.pop('text', True)
+    show_text = kwargs.pop('show_text', show_text)
+    show_domain_text = kwargs.pop('domain_text', show_text)
+    show_chain_text = kwargs.pop('chain_text', show_text)
+    barwidth = kwargs.pop('barwidth', 5)
+    barwidth = kwargs.pop('bar_width', barwidth)
+
+    gap = kwargs.pop('gap', False)
+    overlay = kwargs.pop('overlay', False)
+    overlay = kwargs.pop('overlay_chains', overlay)
+
+    dy = kwargs.pop('dy', None)
+
+    from prody.utilities import showBars
+    from matplotlib.pyplot import figure, xlim, plot
+    from matplotlib.figure import Figure
+
+    fig = kwargs.pop('figure', None)
+
+    if isinstance(fig, Figure):
+        fig_num = fig.number
+    elif fig is None or isinstance(fig, (int, str)):
+        fig_num = fig
+    else:
+        raise TypeError('figure can be either an instance of matplotlib.figure.Figure '
+                        'or a figure number.')
+                        
+    if SETTINGS['auto_show'] and final:
+        figure(fig_num)
+    elif fig_num is not None:
+        figure(fig_num)
+    
+    try:
+        y = np.asarray(y)
+    except:
+        raise TypeError('y should be an array-like instance.')
+
+    if x is not None:
+        _y = []
+        try:
+            x = np.asarray(x, dtype=int)
+        except:
+            raise TypeError('x should be an integer array.')
+
+        if x.min() < 0:
+            raise ValueError('x should be non-negative.')
+
+        if atoms is None:
+            I = np.arange(x.max() + 1)
+        else:
+            if x.max() + 1 > atoms.numAtoms():
+                raise ValueError('size mismatch between x ({0}) and atoms ({1})'
+                             .format(x.max(), atoms.numAtoms()))
+            I = np.arange(atoms.numAtoms())
+        
+        for i in I:
+            ix = np.where(x==i)[0]
+            if len(ix):
+                _y.append(y[ix[0]])
+            else:
+                _y.append(np.nan)
+        y = np.asarray(_y)
+        x = None # clear up x just in case
+
+    ticklabels = labels = datalabels = None
+    def func_ticklabels(val, pos):
+        #The two args are the value and tick position
+        i = int(round(val))
+        J = np.where(x==i)[0]
+        if len(J):
+            label = labels[J[0]]
+        else:
+            label = ''
+
+        return label
+
+    if atoms is not None:
+        if y.shape[0] != atoms.numAtoms():
+            raise ValueError('size mismatch between y ({0}) and atoms ({1})'
+                             .format(y.shape[0], atoms.numAtoms()))
+
+        if overlay:
+            if not gap:
+                gap = True
+            show_chain = False
+            #show_domain = False
+
+        hv = atoms.getHierView()
+        if hv.numChains() == 0:
+            raise ValueError('atoms should contain at least one chain.')
+        elif hv.numChains() == 1:
+            labels = atoms.getResnums()
+            if gap:
+                x = atoms.getResnums()
+                ticklabels = func_ticklabels
+                if overlay:
+                    x = [x]; _y = [y]; _dy = [dy]
+        else:
+            labels = []
+            if gap: 
+                x = []; last = 0
+            if overlay:
+                datalabels = [];  _y = []; _dy = []
+
+            for chain in hv.iterChains():
+                chid = chain.getChid()
+                resnums = chain.getResnums()
+                
+                labels.extend('%s:%d'%(chid, resnum) for resnum in resnums)
+                if gap:
+                    if overlay:
+                        datalabels.append(chid)
+                        x.append(resnums)
+                        _y.append(y[last:last+len(resnums)])
+                        if dy is not None:
+                            _dy.append(dy[last:last+len(resnums)])
+                        last = len(resnums)
+                    else:
+                        x.extend(resnums + last)
+                        last = resnums[-1]
+                    
+        if gap:
+            if overlay:
+                ticklabels = None
+                y = _y
+                if dy is not None:
+                    dy = _dy
+            else:
+                x -= x[0]
+                ticklabels = func_ticklabels
+        else:
+            ticklabels = labels     
+    else:
+        if gap:
+            LOGGER.warn('atoms need to be provided if gap=True')
+        if overlay:
+            LOGGER.warn('atoms need to be provided if overlay=True')
+        gap = False
+        overlay = False
+
+    if gap:
+        if overlay:
+            labels = kwargs.pop('label', datalabels)
+            Z = []
+            for z in zip(y, x):
+                Z.extend(z)
+                #Z.append(linespec)
+            lines = showBars(*Z, ticklabels=ticklabels, 
+                                     gap=True, label=labels, **kwargs)
+        else:
+            lines = showBars(xdata=x, ydata=y, ticklabels=ticklabels, 
+                                     gap=True, **kwargs)
+    else:
+        #lines = showBars(linespec, ydata=y, ticklabels=ticklabels, **kwargs)
+        lines = showBars(ydata=y, ticklabels=ticklabels, **kwargs)
+
+    if zero_line:
+        l = xlim()
+        plot(l, [0, 0], '--', color='gray')
+
+    bars = []
+    texts = []
+
+    show_chain, chain_pos, chids = _checkDomainBarParameter(show_chain, 0., atoms, 'chain')
+     
+    if show_chain:
+        b, t = showDomainBar(chids, x=x, loc=chain_pos, axis='x', 
+                             text_loc=chain_text_loc, text=show_chain_text,
+                             barwidth=barwidth)
+        bars.extend(b)
+        texts.extend(t)
+
+    show_domain, domain_pos, domains = _checkDomainBarParameter(show_domain, 1., atoms, 'domain')
+    if show_domain:
+        if overlay:
+            x = x[0]
+        b, t = showDomainBar(domains, x=x, loc=domain_pos, axis='x', 
+                             text_loc=domain_text_loc,  text=show_domain_text,
+                             barwidth=barwidth)
+        bars.extend(b)
+        texts.extend(t)
+
+    if SETTINGS['auto_show']:
+        showFigure()
+    return lines, bars, texts
+
 pplot = showAtomicLines
 
 def showDomainBar(domains, x=None, loc=0., axis='x', **kwargs):
@@ -2381,3 +2674,675 @@ def showTree_networkx(tree, node_size=20, node_color='red', node_shape='o',
         showFigure()
 
     return mpl.gca()
+
+def showSelectionMatrix(matrix, atoms, selstr_x=None, selstr_y=None, **kwargs):
+    """
+    Show a matrix similarly to showAtomicMatrix but only for
+    selected atoms based on *selstr_x* and *selstr_y*
+
+    :arg selstr_x: a selection string used with sliceAtomicData with axis=0
+        to slice the matrix in the x axis and label it with corresponding atoms
+    :type selstr_x: str
+
+    :arg selstr_y: a selection string used with sliceAtomicData with axis=1
+        to slice the matrix in the y axis and label it with corresponding atoms
+    :type selstr_y: str
+
+    If either of these are left as *None*, then no slicing is performed in that direction.
+    """
+    atoms_x = atoms
+    atoms_y = atoms
+
+    if selstr_x is not None:
+        if not isinstance(selstr_x, str):
+            raise TypeError('selstr_x should be a str')
+
+        matrix = sliceAtomicData(matrix, atoms, selstr_x, axis=0)
+        _, atoms_x = sliceAtoms(atoms, selstr_x)
+
+    if selstr_y is not None:
+        if not isinstance(selstr_y, str):
+            raise TypeError('selstr_y should be a str')
+
+        matrix = sliceAtomicData(matrix, atoms, selstr_y, axis=1)
+        _, atoms_y = sliceAtoms(atoms, selstr_y)
+
+    return showAtomicMatrix(matrix, atoms=[atoms_x, atoms_y], **kwargs)
+
+
+def showRMSDEvolution(rmsd_array=None, ref_coords=None, aligned_coords=None, *args, **kwargs):
+    """
+    Plots RMSD of an aligned trajectory from a reference structure.
+    It accepts either a pre-calculated one-dimensional array of the RMSD over the frames, or 
+    the reference coordinates and the aligned coordinates of the trajectory and performs the
+    RMSD calculation itself.
+    
+
+    :arg rmsd_array: one-dimensional array containing the RMSD values [in Å]
+                     for each trajectory frame relative to the reference structure.
+    :type rmsd_array: :class:`numpy.ndarray` or atomic object
+
+    :arg ref_coords: coordinates of the reference structure
+                     either as an array with shape ``(n_atoms, 3)`` or ``(1, n_atoms, 3)``,
+                     or as an atomic object with a ``getCoords`` method.
+    :type ref_coords: :class:`numpy.ndarray`
+
+    :arg aligned_coords: coordinates of the aligned trajectory.
+    :type aligned_coords: :class:`numpy.ndarray`
+
+    :arg *args: positional arguments passed to Matplotlib's ``plot``.
+    :type *args: tuple
+
+    :arg title: title of the plot. 
+                Default is ``"Frame-to-Reference RMSD"``.
+    :type title: str
+
+    :arg xlabel: label for the x-axis. 
+                 Default is ``"# of Frame"``.
+    :type xlabel: str
+
+    :arg ylabel: label for the y-axis. 
+                 Default is ``"RMSD from Reference [Å]"``.
+    :type ylabel: str
+
+    :arg ax: axes on which to draw the plot. 
+             Default is ``None`` and the current axes are used.
+    :type ax: :class:`matplotlib.axes.Axes`
+
+    :arg **kwargs: keyword arguments passed to Matplotlib's ``plot`` function,
+                   excluding ``title`` and ``ax``.
+    :type **kwargs: dict
+
+    :return: axes containing the plot.
+    :rtype: :class:`matplotlib.axes.Axes`
+    
+    Example usage:
+    >>> import matplotlib.pyplot as plt
+    >>> ref_coords, aligned_coords = alignTrajectory(pdb, dcd, select='resname IOA')
+    >>> plt.figure()
+    >>> showRMSDEvolution(ref_coords=ref_coords, aligned_coords=aligned_coords)
+    >>> plt.show()
+    """
+    
+    import matplotlib.pyplot as plt
+
+
+    has_array = rmsd_array is not None
+    has_coords = ref_coords is not None or aligned_coords is not None
+
+    if has_array == has_coords:
+        raise ValueError("Provide either 'rmsd_array' or both 'ref_coords' and 'aligned_coords'.")
+
+    if not has_array:
+        if hasattr(ref_coords, 'getCoords'):
+            ref_coords = ref_coords.getCoords()
+        ref_coords = np.asarray(ref_coords)
+
+        if ref_coords.ndim == 3:
+            if ref_coords.shape[0] != 1:
+                raise ValueError("reference coordinates must have shape (n_atoms, 3) or (1, n_atoms, 3).")
+            ref_coords = ref_coords[0]
+
+        if ref_coords.ndim != 2 or ref_coords.shape[1] != 3:
+            raise ValueError("reference coordinates must have shape (n_atoms, 3) or (1, n_atoms, 3).")
+
+        aligned_coords = np.asarray(aligned_coords)
+
+        if aligned_coords.ndim != 3 or aligned_coords.shape[2] != 3:
+            raise ValueError(f"aligned_coords must have shape (n_frames, n_atoms, 3), but got {aligned_coords.shape}.")
+
+        if ref_coords.shape != aligned_coords.shape[1:]:
+            raise ValueError(f"Incompatible shapes: reference is {ref_coords.shape}, but aligned frames have {aligned_coords.shape[1:]}.")
+
+        rmsd_array = calcRMSD(ref_coords, target=aligned_coords)
+    else:    
+        rmsd_array = np.asarray(rmsd_array)
+        
+    if rmsd_array.ndim != 1:
+        raise ValueError(f"rmsd_array must be one-dimensional, but got shape {rmsd_array.shape}")
+    if rmsd_array.size == 0:
+        raise ValueError("rmsd_array cannot be empty.")
+
+    ax = kwargs.pop('ax', None)
+    if ax is None:
+        ax = plt.gca()
+
+    xlabel = kwargs.pop('xlabel', "# Frame")
+    ylabel = kwargs.pop('ylabel', "RMSD from Reference [Å]")
+    title = kwargs.pop('title', "Frame-to-Reference RMSD")
+    label = kwargs.get('label', None)
+
+    if 'color' not in kwargs and 'c' not in kwargs and not args:
+        kwargs['color'] = "#36454F"
+
+    if 'lw' not in kwargs and 'linewidth' not in kwargs:
+        kwargs['lw'] = 0.75
+
+    ax.plot(rmsd_array, *args, **kwargs)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    
+    if label is not None:
+        ax.legend()
+
+    return ax
+    
+
+def showPairwiseRMSDHeatmap(distance_matrix=None, aligned_coords=None, *args, **kwargs):
+    """
+    Plots the heatmap of the frame-to-frame pairwise RMSDs using the distance matrix.
+    It accepts either a pre-computed pairwise distance matrix, or
+    the aligned coordinates of the frames and calculates the matrix itself.
+    
+    
+    :arg distance_matrix: two-dimensional array constituting the pairwise distance matrix.
+                          Typically generated using :func:`calcPairwiseRMSD`.
+    :type distance_matrix: :class:`numpy.ndarray`
+    
+    :arg aligned_coords: coordinates of the aligned trajectory.
+    :type aligned_coords: :class:`numpy.ndarray`
+    
+    :arg *args: positional arguments passed to ProDy's ``showMatrix`` function.
+    :type *args: tuple
+    
+    :arg ax: axes on which to draw the plot. 
+             Default is ``None`` and the current axes are used.
+    :type ax: :class:`matplotlib.axes.Axes`
+    
+    :arg **kwargs: keyword arguments passed directly to ProDy's ``showMatrix`` function 
+    :type **kwargs: dict
+    
+    :returns: the Matplotlib axes containing the heatmap.
+    :rtype: :class:`matplotlib.axes.Axes`
+    
+    Example usage:
+    >>> import matplotlib.pyplot as plt
+    >>> _, aligned_coords = alignTrajectory(pdb, dcd, select='resname IOA')
+    >>> distance_matrix = calcPairwiseRMSD(aligned_coords)
+    >>> plt.figure()
+    >>> showPairwiseRMSDHeatmap(distance_matrix)
+    >>> plt.show()
+    """
+    
+    import matplotlib.pyplot as plt
+    
+    
+    has_matrix = distance_matrix is not None
+    has_coords = aligned_coords is not None
+    
+    if has_matrix == has_coords:
+        raise ValueError("Provide exactly one of 'distance_matrix' or 'aligned_coords'.")
+    
+    if has_coords:
+        distance_matrix = calcPairwiseRMSD(aligned_coords)
+    
+    distance_matrix = _validateDistanceMatrix(distance_matrix)
+    
+    title = kwargs.pop('title', 'Pairwise RMSD Distance Matrix')
+    ax = kwargs.pop('ax', None)
+    
+    if ax is not None:
+        plt.sca(ax)
+    else:
+        ax = plt.gca()
+    
+    kwargs.setdefault('cmap', 'viridis')
+    kwargs.setdefault('origin', 'upper')
+    showMatrix(distance_matrix, *args, **kwargs)
+    
+    ax.set_title(title)
+    
+    return ax
+
+
+def showClusterRMSDComparison(all_stats, *args, **kwargs):
+    """
+    Overlays the internal RMSD distributions of all clusters onto a single plot 
+    on the current axis.
+    
+    Expects the list of cluster statistics dictionaries generated by :func:`calcAllClusterStatistics`.
+    
+    Uses Seaborn's :func:`sns.histplot` if available, falling back to 
+    Matplotlib's :meth:`matplotlib.axes.Axes.hist` if Seaborn is not installed.
+    
+    
+    :arg all_stats: list of cluster statistics dictionaries. Each dictionary
+                    must contain the keys ``"cluster"`` and ``"distances"``.
+    :type all_stats: list of dict, or dict
+    
+    :arg *args: positional arguments passed directly to Seaborn's ``histplot`` 
+                or Matplotlib's ``hist`` function.
+    :type *args: tuple
+    
+    :arg title: the title of the generated plot.
+                Default is ``'Intra-Cluster RMSD Distributions'``
+    :type title: str
+    
+    :arg xlabel: the label for the X axis.
+                 Default is ``'RMSD to Medoid [Å]'``
+    :type xlabel: str
+    
+    :arg ylabel: the label for the Y axis.
+                 Default is ``'Frequency'``
+    :type ylabel: str
+    
+    :arg grid: whether to display horizontal grid lines.
+               Default is ``True``.
+    :type grid: bool
+    
+    :arg label: optional label prefix applied to each cluster.
+                For example, ``label='Run 1'`` produces labels such as ``'Run 1 - Cluster 1'``.
+    :type label: str
+    
+    :arg ax: axes on which to draw the plot.
+             Default is ``None`` and the current axes are used.
+    :type ax: :class:`matplotlib.axes.Axes`
+    
+    :arg **kwargs: keyword arguments passed directly to Seaborn's ``histplot`` 
+                   or Matplotlib's ``hist`` function.
+    :type **kwargs: dict
+    
+    :returns: the Matplotlib axes containing the plot.
+    :rtype: :class:`matplotlib.axes.Axes`
+    
+    Example usage:
+    >>> import matplotlib.pyplot as plt
+    >>> all_stats = calcAllClusterStatistics(distance_matrix, cluster_ids)
+    >>> plt.figure()
+    >>> showClusterRMSDComparison(all_stats, label="Simulation A")
+    >>> plt.show()
+    """
+    
+    import matplotlib.pyplot as plt
+    try:
+        import seaborn as sns
+        has_seaborn = True
+    except ImportError:
+        has_seaborn = False
+        
+    if isinstance(all_stats, dict):
+        all_stats = [all_stats]
+        
+    if not all_stats:
+        raise ValueError("all_stats cannot be empty.")
+    
+    ax = kwargs.pop('ax', None)
+    if ax is None:
+        ax = plt.gca()
+        
+    title = kwargs.pop('title', 'Intra-Cluster RMSD Distributions')
+    xlabel = kwargs.pop('xlabel', 'RMSD to Medoid [Å]')
+    ylabel = kwargs.pop('ylabel', 'Frequency')
+    grid = kwargs.pop('grid', True)
+    
+    user_label = kwargs.pop('label', None)
+
+    if 'lw' in kwargs:
+        kwargs['linewidth'] = kwargs.pop('lw')
+    else:
+        kwargs.setdefault('linewidth', 1.5)
+
+    kwargs.setdefault('bins', 50)
+    kwargs.setdefault('alpha', 0.5)
+
+    if has_seaborn:
+        kwargs.setdefault('element', 'step')
+        kwargs.setdefault('stat', 'count')
+        kwargs.setdefault('kde', True)
+    else: # matplotlib fallback
+        LOGGER.info("Package 'seaborn' not found; falling back to matplotlib.pyplot.hist().")
+        kde = kwargs.pop('kde', None)
+        kwargs.pop('element', None)
+        kwargs.pop('stat', None)
+        if kde:
+            LOGGER.warning("Kernel density estimation (kde=True) requires 'seaborn' and will be ignored.")
+        
+        kwargs.setdefault('histtype', 'stepfilled')
+
+    for cluster_stats in all_stats:
+        if "cluster" not in cluster_stats or "distances" not in cluster_stats:
+            raise ValueError("Each cluster statistics dictionary must contain 'cluster' and 'distances'.")
+        
+        cluster_label = f"Cluster {cluster_stats['cluster']}"
+        if user_label:
+            cluster_label = f"{user_label} - {cluster_label}"
+            
+        if has_seaborn:
+            sns.histplot(cluster_stats["distances"], *args, label=cluster_label, ax=ax, **kwargs)
+        else: # matplotlib fallback
+            ax.hist(cluster_stats["distances"], *args, label=cluster_label, **kwargs)
+            
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    
+    ax.legend()
+    
+    if grid:
+        ax.grid(axis='y', alpha=0.3)
+
+    return ax
+
+
+def showClusterRMSDEvolution(cluster_ids, rmsd_array=None, ref_coords=None, aligned_coords=None,
+                             colors=None, mode='background', alpha=0.3, *args, **kwargs):
+    """
+    Plots the RMSD evolution over trajectory frames, highlighting or color-coding
+    the clusters for visual validation.
+
+    Accepts either ``rmsd_array`` or ``ref_coords`` and ``aligned_coords`` for
+    RMSD calculation.
+
+
+    :arg cluster_ids: 1D array mapping each frame to its assigned cluster ID.
+                      Cluster IDs are expected to be 1-based. Values less than 1
+                      (e.g., 0 or -1) are ignored when coloring clusters.
+    :type cluster_ids: :class:`numpy.ndarray`
+
+    :arg rmsd_array: 1D array containing pre-calculated RMSD values per frame.
+                     If ``None``, ``ref_coords`` and ``aligned_coords`` are used
+                     to calculate the RMSD values.
+    :type rmsd_array: :class:`numpy.ndarray`
+
+    :arg ref_coords: reference coordinates for RMSD calculation.
+    :type ref_coords: :class:`numpy.ndarray`
+
+    :arg aligned_coords: aligned trajectory coordinates for RMSD calculation.
+    :type aligned_coords: :class:`numpy.ndarray`
+
+    :arg colors: custom color mapping for clusters. Can be a list or tuple of
+                 colors, a dictionary mapping cluster IDs to colors, or a
+                 Matplotlib colormap name. If ``None``, the ``tab10`` colormap
+                 is used.
+    :type colors: list, tuple, dict, str, or None
+
+    :arg mode: how to visualize cluster membership.
+               Options are ``'background'`` and ``'dots'``.
+               Default is ``'background'``.
+    :type mode: str
+
+    :arg alpha: transparency for background spans or scatter dots.
+                Default is ``0.3``.
+    :type alpha: float
+
+    :arg *args: positional arguments passed directly to :func:`showRMSDEvolution`.
+    :type *args: tuple
+
+    :arg **kwargs: additional keyword arguments passed directly to :func:`showRMSDEvolution`.
+    :type **kwargs: dict
+
+    :returns: Matplotlib axes containing the plot.
+    :rtype: :class:`matplotlib.axes.Axes`
+
+    Example usage:
+    >>> import matplotlib.pyplot as plt
+    >>> ref_coords, aligned_coords = alignTrajectory(pdb, dcd, select='resname DAP')
+    >>> rmsd_evolution = calcRMSD(ref_coords, target=aligned_coords)
+    >>> rmsd_distance_matrix = calcPairwiseRMSD(aligned_coords)
+    >>> hier_cluster_ids, _ = clusterHierarchical(rmsd_distance_matrix)
+    >>> plt.figure()
+    >>> showClusterRMSDEvolution(cluster_ids=hier_cluster_ids, rmsd_array=rmsd_evolution, mode='background')
+    >>> plt.show()
+    """
+
+    import matplotlib.pyplot as plt
+    import warnings
+
+
+    cluster_ids = np.asarray(cluster_ids)
+
+    if cluster_ids.ndim != 1:
+        raise ValueError(f"cluster_ids must be a 1D array, but got shape {cluster_ids.shape}.")
+
+    if cluster_ids.size == 0:
+        raise ValueError("cluster_ids must not be empty.")
+    
+    if mode not in ('background', 'dots'):
+        raise ValueError(f"Unknown mode '{mode}'. Choose either 'background' or 'dots'.")
+    
+    n_frames = len(cluster_ids)
+
+    if rmsd_array is None:
+        if ref_coords is None or aligned_coords is None:
+            raise ValueError("Either rmsd_array or both ref_coords and aligned_coords must be provided.")
+
+        rmsd_array = calcRMSD(ref_coords, target=aligned_coords)
+    else:
+        rmsd_array = np.asarray(rmsd_array)
+
+    if rmsd_array.ndim != 1:
+        raise ValueError(f"rmsd_array must be a 1D array, but got shape {rmsd_array.shape}.")
+
+    if len(rmsd_array) != n_frames:
+        raise ValueError(f"rmsd_array must contain one value per frame, but got {len(rmsd_array)} RMSD values for {n_frames} frames.")
+
+    ax = kwargs.pop('ax', None)
+    if ax is None:
+        ax = plt.gca()
+
+    kwargs['ax'] = ax
+
+    ax = showRMSDEvolution(rmsd_array=rmsd_array, *args, **kwargs)
+    unique_clusters = np.unique(cluster_ids)
+
+    if 0 in unique_clusters:
+        warnings.warn("Cluster ID '0' detected in cluster_ids. "
+                      "This library uses 1-indexed clusters; ID 0 will not be colored.",
+                      UserWarning)
+    valid_clusters = [cluster for cluster in unique_clusters if cluster > 0]
+
+    if colors is None:
+        cmap = plt.get_cmap('tab10')
+    elif isinstance(colors, str):
+        cmap = plt.get_cmap(colors)
+    else:
+        cmap = colors
+
+    if isinstance(colors, (list, tuple)) and len(colors) == 0:
+        raise ValueError("colors cannot be an empty list or tuple.")
+
+    num_colors = getattr(cmap, 'N', 10)
+
+    cluster_color_map = {}
+    for i, cluster_number in enumerate(valid_clusters):
+
+        if isinstance(colors, dict):
+            if cluster_number in colors:
+                cluster_color_map[cluster_number] = colors[cluster_number]
+            else:
+                cluster_color_map[cluster_number] = cmap(i % num_colors)
+
+        elif isinstance(colors, (list, tuple)):
+            cluster_color_map[cluster_number] = colors[i % len(colors)]
+
+        else:
+            cluster_color_map[cluster_number] = cmap(i % num_colors)
+
+    if mode == 'background':
+        change_points = np.where(cluster_ids[:-1] != cluster_ids[1:])[0] + 1
+        segment_starts = np.insert(change_points, 0, 0)
+        segment_ends = np.append(change_points, n_frames)
+        drawn_labels = set()
+        
+        for start, end in zip(segment_starts, segment_ends):
+            cluster_number = cluster_ids[start]
+            if cluster_number not in cluster_color_map:
+                continue
+            cluster_color = cluster_color_map[cluster_number]
+
+            if cluster_number not in drawn_labels:
+                cluster_label = f"Cluster {cluster_number}"
+                drawn_labels.add(cluster_number)
+            else:
+                cluster_label = None
+
+            ax.axvspan(start - 0.5, end - 0.5, color=cluster_color, alpha=alpha, label=cluster_label, linewidth=0)
+
+    elif mode == 'dots':
+        for cluster_number, cluster_color in cluster_color_map.items():
+            mask = cluster_ids == cluster_number
+            frame_indices = np.where(mask)[0]
+            ax.scatter(frame_indices, rmsd_array[mask], color=cluster_color, alpha=alpha,
+                       s=15, label=f"Cluster {cluster_number}", zorder=3)
+            
+    if cluster_color_map:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            def legend_sort_key(pair):
+                label = pair[1]
+                if label.startswith("Cluster "):
+                    try:
+                        return (1, int(label.split()[1]))
+                    except (IndexError, ValueError):
+                        pass
+                return (0, label)
+
+            sorted_pairs = sorted(zip(handles, labels), key=legend_sort_key)
+            sorted_handles, sorted_labels = zip(*sorted_pairs)
+            
+            ax.legend(sorted_handles, sorted_labels, bbox_to_anchor=(1.01, 1), loc='upper left')
+
+    return ax
+
+
+def showClusterBarcode(cluster_ids, colors=None, *args, **kwargs):
+    """
+    Creates a 1D barcode-style timeline of trajectory frames, where each frame
+    is represented by a vertical line colored according to its cluster ID.
+
+
+    :arg cluster_ids: 1D array assigning each frame to a cluster.
+                      Cluster IDs are expected to be 1-based. Values less than 1
+                      (e.g., 0 or -1) are ignored when coloring clusters.
+    :type cluster_ids: :class:`numpy.ndarray`
+
+    :arg colors: custom color mapping for clusters. Can be a list or tuple of
+                 colors, a dictionary mapping cluster IDs to colors, or a
+                 Matplotlib colormap name. If ``None``, the ``tab10`` colormap
+                 is used.
+    :type colors: list, tuple, dict, str, or None
+
+    :arg ax: axes on which to draw the plot.
+             Default is ``None`` and the current axes are used.
+    :type ax: :class:`matplotlib.axes.Axes`
+
+    :arg title: title of the plot.
+                Default is ``'Trajectory Cluster Timeline'``.
+    :type title: str
+
+    :arg xlabel: label for the x-axis.
+                 Default is ``'Frame Index'``.
+    :type xlabel: str
+
+    :arg *args: positional arguments passed directly to Matplotlib's ``axvspan`` function.
+    :type *args: tuple
+
+    :arg **kwargs: keyword arguments passed directly to Matplotlib's ``axvspan`` function.
+    :type **kwargs: dict
+
+    :returns: Matplotlib axes containing the plot.
+    :rtype: :class:`matplotlib.axes.Axes`
+
+    Example usage:
+    >>> import matplotlib.pyplot as plt
+    >>> hier_cluster_ids, _ = clusterHierarchical(distance_matrix)
+    >>> plt.figure()
+    >>> showClusterBarcode(hier_cluster_ids)
+    >>> plt.show()
+    """
+
+    import matplotlib.pyplot as plt
+    import warnings
+
+
+    cluster_ids = np.asarray(cluster_ids)
+
+    if cluster_ids.ndim != 1:
+        raise ValueError(f"cluster_ids must be a 1D array, but got shape {cluster_ids.shape}.")
+    if cluster_ids.size == 0:
+        raise ValueError("cluster_ids must not be empty.")
+
+    ax = kwargs.pop('ax', None)
+    if ax is None:
+        ax = plt.gca()
+
+    title = kwargs.pop('title', 'Trajectory Cluster Timeline')
+    xlabel = kwargs.pop('xlabel', 'Frame Index')
+
+    n_frames = len(cluster_ids)
+
+    unique_clusters = np.unique(cluster_ids)
+    if 0 in unique_clusters:
+        warnings.warn("Cluster ID '0' detected. "
+                      "This library uses 1-indexed clusters; ID 0 will not be colored.", 
+                      UserWarning)
+
+    valid_clusters = [cluster_number for cluster_number in unique_clusters if cluster_number > 0]
+
+    if colors is None:
+        cmap = plt.get_cmap('tab10')
+    elif isinstance(colors, str):
+        cmap = plt.get_cmap(colors)
+    else:
+        cmap = colors
+
+    if isinstance(colors, (list, tuple)) and len(colors) == 0:
+        raise ValueError("colors cannot be an empty list or tuple.")
+
+    num_colors = getattr(cmap, 'N', 10)
+
+    cluster_color_map = {}
+
+    for i, cluster_number in enumerate(valid_clusters):
+        if isinstance(colors, dict):
+            cluster_color_map[cluster_number] = colors.get(cluster_number, cmap(i % num_colors))
+        elif isinstance(colors, (list, tuple)):
+            cluster_color_map[cluster_number] = colors[i % len(colors)]
+        else:
+            cluster_color_map[cluster_number] = cmap(i % num_colors)
+
+    kwargs.setdefault('linewidth', 0)
+
+    change_points = np.where(cluster_ids[:-1] != cluster_ids[1:])[0] + 1
+    segment_starts = np.insert(change_points, 0, 0)
+    segment_ends = np.append(change_points, n_frames)
+
+    drawn_labels = set()
+
+    for start, end in zip(segment_starts, segment_ends):
+        cluster_number = cluster_ids[start]
+
+        if cluster_number not in cluster_color_map:
+            continue
+
+        if cluster_number not in drawn_labels:
+            cluster_label = f"Cluster {cluster_number}"
+            drawn_labels.add(cluster_number)
+        else:
+            cluster_label = None
+
+        ax.axvspan(start - 0.5, end - 0.5, *args, color=cluster_color_map[cluster_number], 
+                   label=cluster_label, **kwargs)
+
+    ax.set_xlim(-0.5, n_frames - 0.5)
+    ax.set_ylim(0, 1)
+
+    ax.set_yticks([])
+    ax.spines['left'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+
+    if cluster_color_map:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            sorted_pairs = sorted(zip(handles, labels), key=lambda x: int(x[1].split()[1]))
+            sorted_handles, sorted_labels = zip(*sorted_pairs)
+            
+            ax.legend(sorted_handles, sorted_labels, bbox_to_anchor=(1.01, 1), loc='upper left')
+
+    return ax
