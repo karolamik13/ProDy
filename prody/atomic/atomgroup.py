@@ -127,7 +127,8 @@ class AtomGroup(Atomic):
                  '_timestamps', '_kdtrees',
                  '_bmap', '_angmap', '_dmap', '_imap',
                  '_domap', '_acmap', '_nbemap', '_cmap',
-                 '_bonds', '_angles', '_dihedrals', '_impropers',
+                 '_bonds', '_bondOrders', '_bondIndex', '_angles',
+                 '_dihedrals', '_impropers',
                  '_donors', '_acceptors', '_nbexclusions', '_crossterms',
                  '_cslabels', '_acsi', '_n_csets', '_data',
                  '_fragments', '_flags', '_flagsts', '_subsets',
@@ -144,6 +145,8 @@ class AtomGroup(Atomic):
         self._kdtrees = None
         self._bmap = None
         self._bonds = None
+        self._bondOrders = None
+        self._bondIndex = None
         self._angmap = None
         self._angles = None
         self._dmap = None
@@ -229,17 +232,35 @@ class AtomGroup(Atomic):
 
         return self._n_atoms
 
-    def __add__(self, other):
+    def __add__(self, other, newAG=True):
+        """This method adds two atom groups. By default this creates a new atom group.
 
+        e.g.:
+           newAG = ag1 + ag2
+           len(newAG) == (len(ag1) + len(ag2))
+        
+        if newAG is set to false, ag1 is extended with the atoms of ag2
+           oldLength = len(ag1)
+           oldID = id(ag1)
+           ag1.__add__(ag2, newAG=False)
+           len(ag1) == (oldLength + len(ag2))
+           id(ag1) === oldID
+        """
         if not isinstance(other, AtomGroup):
             raise TypeError('unsupported operand type(s) for +: {0} and '
                             '{1}'.format(repr(type(self).__name__),
                                          repr(type(other).__name__)))
 
-        new = AtomGroup(self._title + ' + ' + other._title)
+        oldSize = len(self)
+        if newAG:
+            new = AtomGroup(self._title + ' + ' + other._title)
+        else:
+            new = self
+        self._n_atoms += other._n_atoms
+
         if self._n_csets:
             if self._n_csets == other._n_csets:
-                new.setCoords(np.concatenate((self._coords, other._coords), 1))
+                new.setCoords(np.concatenate((self._coords, other._coords), 1), overwrite=True)
                 this = self._anisous
                 that = other._anisous
                 if this is not None and that is not None:
@@ -268,7 +289,7 @@ class AtomGroup(Atomic):
             if this is not None or that is not None:
                 if this is None:
                     shape = list(that.shape)
-                    shape[0] = len(self)
+                    shape[0] = oldSize
                     this = np.zeros(shape, that.dtype)
                 if that is None:
                     shape = list(this.shape)
@@ -285,7 +306,17 @@ class AtomGroup(Atomic):
             for flag in other._flags:
                 if flag not in keys: keys.append(flag)
 
-        for key in keys:
+        # remove aliases
+        skip = []
+        uniqueKeys = []
+        for k in keys:
+            aliases = FLAG_ALIASES.get(k, [k])
+            if aliases[0] not in uniqueKeys and aliases[0] not in skip:
+                uniqueKeys.append(aliases[0])
+                if len(aliases) > 1:
+                    skip.extend(list(aliases[1:]))
+                
+        for key in uniqueKeys:
             this = None
             that = None
             if self._flags:
@@ -295,23 +326,34 @@ class AtomGroup(Atomic):
             if this is not None or that is not None:
                 if this is None:
                     shape = list(that.shape)
-                    shape[0] = len(self)
+                    shape[0] = oldSize
                     this = np.zeros(shape, that.dtype)
                 if that is None:
                     shape = list(this.shape)
                     shape[0] = len(other)
                     that = np.zeros(shape, this.dtype)
                 new._setFlags(key, np.concatenate((this, that)))
-
-        new._n_atoms = self._n_atoms + other._n_atoms
+                
+        if self._bondOrders is not None:
+            if other._bondOrders is not None:
+                bo = np.concatenate([self._bondsOrders, other._bondOrders])
+            else:
+                bo = np.concatenate([self._bondsOrders, np.ones(len(other), np.int8)])
+        else:
+            if other._bondOrders is not None:
+                bo = np.concatenate([np.ones(len(self), np.int8), self._bondsOrders])
+            else:
+                bo = None
 
         if self._bonds is not None and other._bonds is not None:
             new.setBonds(np.concatenate([self._bonds,
-                                         other._bonds + self._n_atoms]))
+                                         other._bonds + oldSize]), bo)
         elif self._bonds is not None:
-            new.setBonds(self._bonds.copy())
+            new.setBonds(self._bonds.copy(), bo)
+
         elif other._bonds is not None:
-            new.setBonds(other._bonds + self._n_atoms)
+            bonds = other._bonds + self._n_atoms
+            new.setBonds(bonds, bo)
 
         if self._angles is not None and other._angles is not None:
             new.setAngles(np.concatenate([self._angles,
@@ -394,6 +436,10 @@ class AtomGroup(Atomic):
                  np.all(self._coords == other._coords)) and
                 all(np.all(self._data[key] == other._data[key])
                     for key in self._data))
+
+    def __hash__(self):
+        return object.__hash__(self)
+
 
     def __iter__(self):
         """Yield atom instances."""
@@ -493,7 +539,7 @@ class AtomGroup(Atomic):
         if self._coords is not None:
             return self._coords[self._acsi]
 
-    def setCoords(self, coords, label=''):
+    def setCoords(self, coords, label='', overwrite=False):
         """Set coordinates of atoms.  *coords* may be any array like object
         or an object instance with :meth:`getCoords` method.  If the shape of
         coordinate array is ``(n_csets > 1, n_atoms, 3)``, it will replace all
@@ -502,7 +548,9 @@ class AtomGroup(Atomic):
         If shape of *coords* is ``(n_atoms, 3)`` or ``(1, n_atoms, 3)``, it
         will replace the active coordinate set.  *label* argument may be used
         to label coordinate set(s).  *label* may be a string or a list of
-        strings length equal to the number of coordinate sets."""
+        strings length equal to the number of coordinate sets. The optional
+        argument *overwrite* can be set to True to force resizing the
+        coordinates array when the number of atoms in the AtomGroup changed."""
 
         atoms = coords
         try:
@@ -524,7 +572,7 @@ class AtomGroup(Atomic):
             raise TypeError('coords must be a numpy array or an '
                             'object with `getCoords` method')
 
-        self._setCoords(coords, label=label)
+        self._setCoords(coords, label=label, overwrite=overwrite)
 
     def _setCoords(self, coords, label='', overwrite=False):
         """Set coordinates without data type checking.  *coords* must
@@ -532,7 +580,9 @@ class AtomGroup(Atomic):
         :class:`~numpy.float64`, e.g. :class:`~numpy.float32`.  *label*
         argument may be used to label coordinate sets.  *label* may be
         a string or a list of strings length equal to the number of
-        coordinate sets."""
+        coordinate sets. The optional argument *overwrite* can be set
+        to True to force resizing the coordinates array when the number
+        of atoms in the AtomGroup changed."""
 
         n_atoms = self._n_atoms
         if n_atoms:
@@ -1204,15 +1254,37 @@ class AtomGroup(Atomic):
         else:
             raise TypeError('labels must be a list')
 
-    def setBonds(self, bonds):
+    def setBondOrders(self, bondOrders):
+        """Set covalent bond order. *bondOrders* must be a list or an array
+        of integers and provide a value for each bond. Possible values are
+        1:single, 2:double, 3:triple, 4:aromatic, 5:amide. The bond order of
+        all bonds must be set at once. This method must be called after
+        the setBonds() has been called. The bond order is stored in the
+        *_bondOrders* array."""
+
+        if bondOrders is None:
+          self._bondOrders = bondOrders
+          return
+      
+        if len(bondOrders)!=len(self._bonds):
+            raise ValueError('invalid bond order list, bond and bond order length mismatch')
+        if min(bondOrders)<1 or max(bondOrders)>5:
+            raise ValueError('invalid bond order value, values must range from 1 to 5')
+
+        self._bondOrders = np.array(bondOrders, np.int8)
+
+    def setBonds(self, bonds, bondOrders=None):
         """Set covalent bonds between atoms.  *bonds* must be a list or an
-        array of pairs of indices.  All bonds must be set at once.  Bonding
-        information can be used to make atom selections, e.g. ``"bonded to
-        index 1"``.  See :mod:`.select` module documentation for details.
-        Also, a data array with number of bonds will be generated and stored
-        with label *numbonds*.  This can be used in atom selections, e.g.
-        ``'numbonds 0'`` can be used to select ions in a system. If *bonds* 
-        is empty or **None**, then all bonds will be removed for this 
+        array of pairs of indices. Optionally *bondOrders* can be specified
+        (see :meth:`setBondOrder` method).  All bonds must be
+        set at once.  Bonding information can be used to make atom selections,
+        e.g. ``"bonded to index 1"``.  See :mod:`.select` module documentation
+        for details. Also, a data array with number of bonds will be generated
+        and stored with label *numbonds*.  This can be used in atom selections,
+        e.g. ``'numbonds 0'`` can be used to select ions in a system. The keys
+        in the *_bondIndex* dictionary is a string representation of the bond's
+        atom indices i.e. '%d %d'%(i, j) with i<j. If  *bonds*  is empty or
+        **None**, then all bonds will be removed for this
         :class:`.AtomGroup`. """
 
         if bonds is None or len(bonds) == 0:
@@ -1229,18 +1301,34 @@ class AtomGroup(Atomic):
             raise ValueError('bonds.shape must be (n_bonds, 2)')
         if bonds.min() < 0:
             raise ValueError('negative atom indices are not valid')
+
         n_atoms = self._n_atoms
         if bonds.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
+
+        # NOTE: sorting WITHIN each row is load-bearing here, unlike for
+        # angles, dihedrals, impropers and cross-terms, whose atom order
+        # carries meaning and must be preserved.  A bond is symmetric, so
+        # (i, j) and (j, i) are the same bond, and np.unique below only sorts
+        # and de-duplicates whole rows, never their contents.  Sorting each
+        # pair first is what makes the two spellings collapse into one, and it
+        # is also what guarantees i < j in the '%d %d' keys of _bondIndex.
+        # np.unique sorts the rows itself, so no separate row sort is needed.
         bonds.sort(1)
-        bonds = bonds[bonds[:, 1].argsort(), ]
-        bonds = bonds[bonds[:, 0].argsort(), ]
         bonds = np.unique(bonds, axis=0)
+
+        d = {}
+        for n, b in enumerate(bonds):
+            key = '%d %d'%(b[0], b[1])
+            d[key] = n
+        self._bondIndex = d
 
         self._bmap, self._data['numbonds'] = evalBonds(bonds, n_atoms)
         self._bonds = bonds
         self._fragments = None
 
+        self.setBondOrders(bondOrders)
+            
     def numBonds(self):
         """Returns number of bonds.  Use :meth:`setBonds` or 
         :meth:`inferBonds` for setting bonds."""
@@ -1314,10 +1402,11 @@ class AtomGroup(Atomic):
         n_atoms = self._n_atoms
         if angles.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
-        angles.sort(1)
-        angles = angles[angles[:, 2].argsort(), ]
-        angles = angles[angles[:, 1].argsort(), ]
-        angles = angles[angles[:, 0].argsort(), ]
+        # NOTE: the atom order WITHIN a term is meaningful -- it identifies an
+        # angle's vertex, a torsion's sequence and a CMAP term's two coupled
+        # dihedrals -- so it must not be sorted.  The order of the terms
+        # themselves is left as given too, so that a topology read from a file
+        # is written back out unchanged.
 
         self._angmap, self._data['numangles'] = evalAngles(angles, n_atoms)
         self._angles = angles
@@ -1373,11 +1462,11 @@ class AtomGroup(Atomic):
         n_atoms = self._n_atoms
         if dihedrals.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
-        dihedrals.sort(1)
-        dihedrals = dihedrals[dihedrals[:, 3].argsort(), ]
-        dihedrals = dihedrals[dihedrals[:, 2].argsort(), ]
-        dihedrals = dihedrals[dihedrals[:, 1].argsort(), ]
-        dihedrals = dihedrals[dihedrals[:, 0].argsort(), ]
+        # NOTE: the atom order WITHIN a term is meaningful -- it identifies an
+        # angle's vertex, a torsion's sequence and a CMAP term's two coupled
+        # dihedrals -- so it must not be sorted.  The order of the terms
+        # themselves is left as given too, so that a topology read from a file
+        # is written back out unchanged.
 
         self._dmap, self._data['numdihedrals'] = evalDihedrals(
             dihedrals, n_atoms)
@@ -1434,11 +1523,11 @@ class AtomGroup(Atomic):
         n_atoms = self._n_atoms
         if impropers.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
-        impropers.sort(1)
-        impropers = impropers[impropers[:, 3].argsort(), ]
-        impropers = impropers[impropers[:, 2].argsort(), ]
-        impropers = impropers[impropers[:, 1].argsort(), ]
-        impropers = impropers[impropers[:, 0].argsort(), ]
+        # NOTE: the atom order WITHIN a term is meaningful -- it identifies an
+        # angle's vertex, a torsion's sequence and a CMAP term's two coupled
+        # dihedrals -- so it must not be sorted.  The order of the terms
+        # themselves is left as given too, so that a topology read from a file
+        # is written back out unchanged.
 
         self._imap, self._data['numimpropers'] = evalImpropers(
             impropers, n_atoms)
@@ -1502,10 +1591,10 @@ class AtomGroup(Atomic):
         n_atoms = self._n_atoms
         if donors.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
-        donors.sort(1)
-        donors = donors[donors[:, 1].argsort(), ]
-        donors = donors[donors[:, 0].argsort(), ]
-        donors = np.unique(donors, axis=0)
+        # NOTE: a CHARMM !NDON record is an ORDERED pair -- a hydrogen-bond donor's heavy atom and its hydrogen --
+        # so neither the two indices nor the order of the records is sorted, and
+        # duplicates are not collapsed: a topology read from a file is written
+        # back out unchanged.  Contrast setBonds, whose pairs are symmetric.
 
         self._domap, self._data['numdonors'] = evalDonors(donors, n_atoms)
         self._donors = donors
@@ -1568,10 +1657,10 @@ class AtomGroup(Atomic):
         n_atoms = self._n_atoms
         if acceptors.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
-        acceptors.sort(1)
-        acceptors = acceptors[acceptors[:, 1].argsort(), ]
-        acceptors = acceptors[acceptors[:, 0].argsort(), ]
-        acceptors = np.unique(acceptors, axis=0)
+        # NOTE: a CHARMM !NACC record is an ORDERED pair -- an acceptor and its antecedent --
+        # so neither the two indices nor the order of the records is sorted, and
+        # duplicates are not collapsed: a topology read from a file is written
+        # back out unchanged.  Contrast setBonds, whose pairs are symmetric.
 
         self._acmap, self._data['numacceptors'] = evalAcceptors(acceptors, n_atoms)
         self._acceptors = acceptors
@@ -1634,9 +1723,10 @@ class AtomGroup(Atomic):
         n_atoms = self._n_atoms
         if nbexclusions.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
+        # A non-bonded exclusion is symmetric, so -- as in setBonds -- sorting
+        # within each pair is what collapses (i, j) and (j, i), and np.unique
+        # sorts the rows itself.
         nbexclusions.sort(1)
-        nbexclusions = nbexclusions[nbexclusions[:, 1].argsort(), ]
-        nbexclusions = nbexclusions[nbexclusions[:, 0].argsort(), ]
         nbexclusions = np.unique(nbexclusions, axis=0)
 
         self._nbemap, self._data['numnbexclusions'] = evalNBExclusions(
@@ -1675,8 +1765,10 @@ class AtomGroup(Atomic):
                 yield a, b
 
     def setCrossterms(self, crossterms):
-        """Set covalent crossterms between atoms.  *crossterms* must be a list or an
-        array of triplets of indices.  All crossterms must be set at once.  Crossterm
+        """Set CMAP cross-terms between atoms.  *crossterms* must be a list or an
+        array of EIGHT indices per term -- the two coupled dihedrals of a CHARMM CMAP
+        term, in the order they appear in the ``!NCRTERM`` section.  All crossterms
+        must be set at once.  Crossterm
         information can be used to make atom selections, e.g. ``"crossterm to
         index 1"``.  See :mod:`.select` module documentation for details.
         Also, a data array with number of crossterms will be generated and stored
@@ -1687,18 +1779,18 @@ class AtomGroup(Atomic):
             crossterms = np.array(crossterms, int)
         if crossterms.ndim != 2:
             raise ValueError('crossterms.ndim must be 2')
-        if crossterms.shape[1] != 4:
-            raise ValueError('crossterms.shape must be (n_crossterms, 4)')
+        if crossterms.shape[1] != 8:
+            raise ValueError('crossterms.shape must be (n_crossterms, 8)')
         if crossterms.min() < 0:
             raise ValueError('negative atom indices are not valid')
         n_atoms = self._n_atoms
         if crossterms.max() >= n_atoms:
             raise ValueError('atom indices are out of range')
-        crossterms.sort(1)
-        crossterms = crossterms[crossterms[:, 3].argsort(), ]
-        crossterms = crossterms[crossterms[:, 2].argsort(), ]
-        crossterms = crossterms[crossterms[:, 1].argsort(), ]
-        crossterms = crossterms[crossterms[:, 0].argsort(), ]
+        # NOTE: the atom order WITHIN a term is meaningful -- it identifies an
+        # angle's vertex, a torsion's sequence and a CMAP term's two coupled
+        # dihedrals -- so it must not be sorted.  The order of the terms
+        # themselves is left as given too, so that a topology read from a file
+        # is written back out unchanged.
 
         self._cmap, self._data['numcrossterms'] = evalCrossterms(
             crossterms, n_atoms)
@@ -1728,12 +1820,12 @@ class AtomGroup(Atomic):
                 yield Crossterm(self, crossterm, acsi)
 
     def _iterCrossterms(self):
-        """Yield quadruplets of crosstermed atom indices. Use :meth:`setCrossterms` for setting
-        crossterms."""
+        """Yield the atom indices of each CMAP cross-term, eight per term. Use
+        :meth:`setCrossterms` for setting crossterms."""
 
         if self._crossterms is not None:
-            for a, b, c, d in self._crossterms:
-                yield a, b, c, d
+            for crossterm in self._crossterms:
+                yield crossterm
 
     def numFragments(self):
         """Returns number of connected atom subsets."""
